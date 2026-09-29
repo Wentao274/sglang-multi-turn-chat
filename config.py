@@ -73,8 +73,8 @@ def build_parser(env: dict = None):
                          help="ShareGPT V3 json 路径，留空自动下载（可从 .env 读取）")
     dataset.add_argument("--num-sessions", "--num-prompts", dest="num_sessions",
                          type=int, default=100, help="会话(对话)数量")
-    dataset.add_argument("--num-turns", type=int, default=8,
-                         help="每个会话的对话轮数")
+    dataset.add_argument("--num-turns", type=int, default=14,
+                         help="每个会话的最大对话轮数上限(自然轮数不足此值的会话按实际轮数)")
     dataset.add_argument("--max-tokens-per-turn", type=int, default=256,
                          help="每轮生成 max_tokens 上限")
     dataset.add_argument("--system-prompt-len", type=int, default=0,
@@ -82,7 +82,7 @@ def build_parser(env: dict = None):
     dataset.add_argument("--context-len", type=int, default=None,
                          help="过滤首轮(system+user)加单轮输出超过该长度的会话")
     dataset.add_argument("--min-turns", type=int, default=2,
-                         help="仅保留 user 轮数不少于该值的原始对话")
+                         help="仅保留 user 轮数不少于该值的原始对话(变长轮次的过滤门槛)")
     dataset.add_argument("--tokenizer", type=str,
                          default=_env_default("TOKENIZER"),
                          help="tokenizer 名，留空则用 --model（可从 .env 读取）")
@@ -99,8 +99,8 @@ def build_parser(env: dict = None):
     ramp.add_argument("--start-tpm", type=float, default=0.0, help="爬坡起始 TPM(优先于 start-rps)")
     ramp.add_argument("--target-tpm", type=float, default=None,
                       help="稳态目标 TPM(优先于 target-rps)，按 avg-tokens-per-request 折算 RPS")
-    ramp.add_argument("--avg-tokens-per-request", type=float, default=512.0,
-                      help="TPM->RPS 折算用：每请求平均 token 数")
+    ramp.add_argument("--avg-tokens-per-request", type=float, default=0.0,
+                      help="TPM->RPS 折算用：每会话平均总 token 数；0=自动从数据集估算")
 
     gen = parser.add_argument_group("generation")
     gen.add_argument("--ignore-eos", action="store_true",

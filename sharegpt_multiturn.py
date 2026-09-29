@@ -54,7 +54,8 @@ def load_sharegpt_multiturn(
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    need = max(min_turns, num_turns)
+    need = min_turns
+    cap = num_turns
     seen_keys = set()
     candidates = []
     for item in raw:
@@ -76,7 +77,7 @@ def load_sharegpt_multiturn(
         raise ValueError(
             f"数据集容量不足：需要 {num_sessions} 条不重复会话，"
             f"ShareGPT 中满足 >={need} user 轮且去重后仅 {available} 条。"
-            f"请减小 --num-sessions / --num-turns，或放宽 --min-turns，"
+            f"请减小 --num-sessions 或放宽 --min-turns，"
             f"或提供更大的 --dataset-path。"
         )
     random.shuffle(candidates)
@@ -85,7 +86,7 @@ def load_sharegpt_multiturn(
     for user_msgs in candidates:
         if len(rows) >= num_sessions:
             break
-        turns = user_msgs[:num_turns]
+        turns = user_msgs[:cap]
 
         if apply_chat_template:
             turns = [
@@ -127,9 +128,9 @@ def load_sharegpt_multiturn(
         )
 
     total_in = sum(r.prompt_len for r in rows)
-    total_out = sum(r.output_len for r in rows) * num_turns
+    total_out = sum(r.output_len * len(r.prompt) for r in rows)
     print(
-        f"[sharegpt-multiturn] loaded={len(rows)} turns={num_turns} "
+        f"[sharegpt-multiturn] loaded={len(rows)} max_turns={cap} min_turns={need} "
         f"system_prompt_len={system_prompt_len} (per-session unique) "
         f"unique_first_turns={available} "
         f"first-turn tokens sum={total_in} est output tokens={total_out}"

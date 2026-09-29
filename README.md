@@ -112,16 +112,16 @@ DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
 ```bash
 # 方式一：激活虚拟环境后直接运行
 python bench_multi_turn.py \
-  --num-sessions 5000 --num-turns 8 --max-tokens-per-turn 256 \
+  --num-sessions 5000 --num-turns 14 --min-turns 8 --max-tokens-per-turn 256 \
   --system-prompt-len 2048 \
-  --start-tpm 0 --target-tpm 10000 --avg-tokens-per-request 1024 \
-  --ramp-seconds 120 --sustain-seconds 600 \
-  --max-concurrency 256 \
+  --start-tpm 0 --target-tpm 214000 \
+  --ramp-seconds 300 --sustain-seconds 600 \
+  --max-concurrency 500 \
   --cache-report \
-  --max-error-rate 0.10 \
-  --throughput-drop-ratio 0.5 \
+  --max-error-rate 0.20 \
+  --throughput-drop-ratio 0.3 \
   --max-ttft-p99-ms 30000 \
-  --baseline-warmup-seconds 30 \
+  --baseline-warmup-seconds 120 \
   --monitor-window 30 --monitor-interval 10 \
   --accept-steady-tpm 100000000 \
   --accept-request-rps 0.6 \
@@ -137,11 +137,11 @@ python bench_multi_turn.py \
   --tag glm-multiturn-steady
 ```
 
-> **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。模板中加压到 950 RPM（约 16,000 TPM），验收要求 100,000,000 TPM。上例设 `--target-tpm 10000` 为示例值，请根据实际服务能力调整。
+> **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。`--avg-tokens-per-request` 默认 0=自动估算（从数据集每会话的轮数和 token 长度推算），无需手动设置。`--target-tpm 214000` 基于上次测试服务端实测容量 267K TPM 的 80% 安全余量。
 
 ```bash
 # 方式二：不激活虚拟环境，用 uv run（自动使用 .venv）
-uv run python bench_multi_turn.py --num-sessions 5000 --num-turns 8 ...
+uv run python bench_multi_turn.py --num-sessions 5000 --num-turns 14 --min-turns 8 ...
 ```
 
 > `--base-url`、`--model`、`--tokenizer`、`--api-key`、`--dataset-path` 自动从 `configs/.env` 读取，CLI 同名参数可覆盖。
@@ -153,16 +153,16 @@ uv run python bench_multi_turn.py --num-sessions 5000 --num-turns 8 ...
 | `.env` 中 `DATASET_PATH`（去重后不足会报错） | 需求1：ShareGPT 数据集 + 压测容量 |
 | `--num-sessions 5000` | 需求1：压测容量 |
 | `--system-prompt-len 2048`（每会话唯一随机） | 需求1：防缓存命中 + 长上下文 |
-| `--start-tpm 0 --target-tpm 100000000 --ramp-seconds 120` | 需求2：起压点匀速爬坡至目标稳态 |
+| `--start-tpm 0 --target-tpm 214000 --ramp-seconds 300` | 需求2：起压点匀速爬坡至目标稳态 |
 | `--sustain-seconds 600` | 需求2：稳态后持续压测 |
 | 指标自动只统计 `start_time >= 爬坡结束` 的会话 | 需求2：从稳态开始记录指标 |
 | `--max-error-rate / --throughput-drop-ratio / --max-ttft-p99-ms` | 需求3：异常/衰减信号终止 |
-| `--baseline-warmup-seconds 30` | 需求3：稳态建基线后才开始判定 |
+| `--baseline-warmup-seconds 120` | 需求3：稳态建基线后才开始判定 |
 | 终止后自动写 `result.jsonl` + `report.md`（含 9 章节报告） | 需求3：终止即输出报告 |
 | `--cache-report` | 采集 prefix cache 命中率 |
 | `--accept-*` 系列参数 | 验收明细表的要求值 |
 
-调整 `--target-tpm`、`--num-sessions`、`--sustain-seconds` 即可适配不同压测目标。`--target-tpm` 按 `--avg-tokens-per-request`（默认 512，上例设 1024）折算 RPS。
+调整 `--target-tpm`、`--num-sessions`、`--sustain-seconds` 即可适配不同压测目标。`--avg-tokens-per-request` 默认 0=自动从数据集估算每会话总 token 数，无需手动设置。
 
 ### 其他示例
 
@@ -194,10 +194,11 @@ python bench_multi_turn.py \
 | `--tokenizer` | tokenizer 名/路径，留空则用 `--model`（可从 .env 读取） |
 | `--dataset-path` | ShareGPT V3 JSON 路径（可从 .env 读取） |
 | `--num-sessions` | 会话数（每次发一个完整多轮对话） |
-| `--num-turns` | 每会话轮数；上下文随轮次线性增长 |
+| `--num-turns` | 每会话最大轮数上限；自然轮数不足此值的会话按实际轮数 |
+| `--min-turns` | 仅保留 user 轮数不少于该值的原始对话（变长轮次过滤门槛，默认 2） |
 | `--max-tokens-per-turn` | 每轮生成 max_tokens 上限 |
 | `--system-prompt-len` | >0 注入该长度随机 system prompt，首轮即长上下文 |
-| `--target-tpm` | 稳态目标 TPM，按 `--avg-tokens-per-request` 折算 RPS |
+| `--target-tpm` | 稳态目标 TPM，按 `--avg-tokens-per-request` 折算 RPS（默认 0=自动估算） |
 | `--start-rps`/`--target-rps` | 直接指定 RPS（被 `--target-tpm` 覆盖） |
 | `--ramp-seconds` | RPS 线性爬坡时长 |
 | `--sustain-seconds` | 稳态持续时长；留空表示发完全部 `--num-sessions` |
@@ -245,7 +246,7 @@ python bench_multi_turn.py \
 ```
 results/
   glm-5.3-20260929-193500/
-    multi_turn_sglang-oai-chat_5000s_8t.jsonl
+    multi_turn_sglang-oai-chat_5000s_14t.jsonl
     report.md
 ```
 

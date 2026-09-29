@@ -98,6 +98,20 @@ async def run_benchmark(args):
         print("[error] no sessions loaded", file=sys.stderr)
         return 1
 
+    if args.avg_tokens_per_request <= 0:
+        total_est = 0.0
+        for row in input_requests:
+            n = len(row.prompt)
+            total_est += n * (row.prompt_len + row.output_len) + \
+                row.output_len * n * (n - 1) / 2.0
+        args.avg_tokens_per_request = total_est / len(input_requests)
+        print(
+            f"[auto] avg_tokens_per_request = {args.avg_tokens_per_request:.0f} "
+            f"(estimated from {len(input_requests)} sessions, "
+            f"prompt_len~{input_requests[0].prompt_len}, turns~"
+            f"{len(input_requests[0].prompt)})"
+        )
+
     base_url = args.base_url.rstrip("/")
     api_url = build_api_url(args.base_url)
     backend = args.backend
