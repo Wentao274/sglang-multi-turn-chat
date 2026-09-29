@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -101,6 +102,13 @@ async def run_benchmark(args):
     api_url = build_api_url(args.base_url)
     backend = args.backend
     model = args.model or resolve_model(base_url)
+
+    safe_model = re.sub(r'[^\w\-.]', '_', model or "unknown")
+    subdir_name = f"{safe_model}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    output_subdir = os.path.join(args.output_dir, subdir_name)
+    os.makedirs(output_subdir, exist_ok=True)
+    args._output_subdir = output_subdir
+    print(f"[output] -> {output_subdir}")
 
     start_rps, target_rps = compute_rps(args)
     preflight_capacity(args, target_rps, len(input_requests))
@@ -393,8 +401,9 @@ def write_jsonl(args, metrics_full, metrics_steady, all_flat, steady_flat,
 
     out_file = args.output_file
     if not out_file:
-        stamp = datetime.now().strftime("%m%d")
-        out_file = f"multi_turn_{backend}_{stamp}_{args.num_sessions}s_{args.num_turns}t.jsonl"
+        out_file = f"multi_turn_{backend}_{args.num_sessions}s_{args.num_turns}t.jsonl"
+    out_file = os.path.join(getattr(args, "_output_subdir", ""), out_file)
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
     with open(out_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(result, ensure_ascii=False) + "\n")
     print(f"[result] JSONL -> {out_file}")
@@ -414,8 +423,9 @@ def write_markdown_report(args, metrics_full, metrics_steady,
     )
     base = args.report_md
     if not base:
-        jsonl = args.output_file or f"multi_turn_{backend}_{datetime.now().strftime('%m%d')}.jsonl"
-        base = jsonl.rsplit(".", 1)[0] + ".md"
+        base = "report.md"
+    base = os.path.join(getattr(args, "_output_subdir", ""), base)
+    os.makedirs(os.path.dirname(base) or ".", exist_ok=True)
     with open(base, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"[result] Markdown report -> {base}")

@@ -1,0 +1,5 @@
+sglang>=0.5.10
+numpy
+requests
+tqdm
+transformers

@@ -148,9 +148,12 @@ def build_parser(env: dict = None):
                          help="验收要求：usage 信息完整(1=必须)")
 
     out = parser.add_argument_group("output")
-    out.add_argument("--output-file", type=str, default=None, help="结果 JSONL 文件，留空自动命名")
+    out.add_argument("--output-dir", type=str, default="results",
+                      help="结果输出根目录（默认 results），每次执行在其下创建 model-MMDD-HHMMSS 子目录")
+    out.add_argument("--output-file", type=str, default=None,
+                      help="结果 JSONL 文件名（仅文件名，不含路径，自动放入输出子目录；留空自动命名）")
     out.add_argument("--report-md", type=str, default=None,
-                      help="Markdown 报告路径，留空则用 JSONL 同名 .md")
+                      help="Markdown 报告文件名（仅文件名，不含路径，自动放入输出子目录；留空自动命名）")
     out.add_argument("--output-details", action="store_true", help="写入每轮明细")
     out.add_argument("--tag", type=str, default="", help="结果 tag")
 

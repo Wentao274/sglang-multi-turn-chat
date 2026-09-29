@@ -25,11 +25,50 @@
 - **缺口 A**：内置 `ShareGPTDataset` 只取前 2 轮（单轮）。本框架读原始 JSON，保留全多轮 user 消息，可选注入长 system prompt。
 - **缺口 B**：内置 `get_request` 仅支持单一固定速率泊松/全量并发。本框架 `get_ramp_request` 实现匀速爬坡。
 
-## 依赖
+## 环境与依赖（uv）
+
+本项目使用 [uv](https://docs.astral.sh/uv/) 管理虚拟环境和依赖。
+
+### 1. 安装 uv
 
 ```bash
-pip install sglang            # >= 0.5.10
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 或通过 pip
+pip install uv
 ```
+
+### 2. 创建虚拟环境并安装依赖
+
+```bash
+# 创建虚拟环境（默认 .venv 目录，Python 3.10+）
+uv venv
+
+# 安装全部依赖（读取 requirements.txt）
+uv pip install -r requirements.txt
+```
+
+### 3. 激活虚拟环境
+
+```bash
+# Linux / macOS
+source .venv/bin/activate
+
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+```
+
+### 4. 验证安装
+
+```bash
+python -c "import sglang.benchmark.serving; print('OK')"
+```
+
+> 也可不激活虚拟环境，直接用 `uv run python bench_multi_turn.py ...` 运行，uv 会自动使用 `.venv`。
 
 ## 配置（configs/.env）
 
@@ -64,6 +103,7 @@ DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
 配置好 `configs/.env` 后，命令行只需传压测参数：
 
 ```bash
+# 方式一：激活虚拟环境后直接运行
 python bench_multi_turn.py \
   --num-sessions 5000 --num-turns 8 --max-tokens-per-turn 256 \
   --system-prompt-len 2048 \
@@ -88,6 +128,11 @@ python bench_multi_turn.py \
   --report-md report.md \
   --output-details \
   --tag glm-multiturn-steady
+```
+
+```bash
+# 方式二：不激活虚拟环境，用 uv run（自动使用 .venv）
+uv run python bench_multi_turn.py --num-sessions 5000 --num-turns 8 ...
 ```
 
 > `--base-url`、`--model`、`--tokenizer`、`--api-key`、`--dataset-path` 自动从 `configs/.env` 读取，CLI 同名参数可覆盖。
@@ -156,7 +201,9 @@ python bench_multi_turn.py \
 | `--baseline-warmup-seconds` | 稳态后建立吞吐基线的时长，之后才开始衰减判定（默认 30） |
 | `--monitor-window` | 衰减检测滚动窗口（默认 30s） |
 | `--disable-monitor` | 关闭衰减监控，跑完全部 |
-| `--report-md` | Markdown 报告路径，留空则用 JSONL 同名 `.md` |
+| `--output-dir` | 结果根目录（默认 `results`），每次执行创建 `model-YYYYMMDD-HHMMSS` 子目录 |
+| `--output-file` | JSONL 文件名（仅文件名，自动放入子目录） |
+| `--report-md` | Markdown 报告文件名（仅文件名，自动放入子目录，默认 `report.md`） |
 | `--accept-steady-tpm` | 验收要求：稳态 TPM |
 | `--accept-request-rps` | 验收要求：稳态 RPS（默认 0.6） |
 | `--accept-success-rate` | 验收要求：成功率（默认 0.995） |
@@ -183,6 +230,21 @@ python bench_multi_turn.py \
 | **实际长度与轮数** | JSON 块：input/output_mean/rounds_per_session 分布 |
 
 同时输出 JSONL 文件（含 `full`/`steady` 双套指标 + `monitor_history` 时间序列）。
+
+每次执行自动在 `--output-dir`（默认 `results`）下创建子目录，格式为 `{模型名}-{YYYYMMDD-HHMMSS}`，所有输出文件自动放入该子目录：
+
+```
+results/
+  glm-5.3-20260929-193500/
+    multi_turn_sglang-oai-chat_5000s_8t.jsonl
+    report.md
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--output-dir` | 结果根目录（默认 `results`） |
+| `--output-file` | JSONL 文件名（仅文件名，自动放入子目录；留空自动命名） |
+| `--report-md` | Markdown 报告文件名（仅文件名，自动放入子目录；留空默认 `report.md`） |
 
 > 注：多轮模式下输入 token 按累积上下文估算（round-0 prompt + 前序轮次 output_len 之和），反映服务端实际接收的上下文长度。输出 token 逐轮精确统计。
 
