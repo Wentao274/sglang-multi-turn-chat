@@ -197,18 +197,16 @@ def generate_markdown(
     steady_itls = [x for o in ok_steady for x in (o.itl or []) if x > 0]
 
     lines = []
-    lines.append(f"# 多轮长上下文对话 Benchmark 报告")
-    lines.append("")
-    lines.append(f"> 生成时间：{now_str}  |  模型：`{model}`  |  后端：`{backend}`")
+    lines.append(f"# 多轮数据集 Benchmark")
     lines.append("")
 
-    status = "异常终止" if terminated else "正常完成"
+    status = "INCOMPLETE" if terminated else "COMPLETE"
     lines.append(f"验收状态：**{status}**")
     if terminated:
         lines.append(f"- 终止原因：`{termination_reason}`")
     lines.append("")
     lines.append(
-        "稳态指标仅使用连续达标窗口，按请求完成时间归集；分轮与分模式均采用明确窗口。"
+        "全程数据完整保留。稳态指标仅使用连续达标窗口，按请求完成时间归集；分轮与分模式均采用明确窗口。"
         "TTFT 为客户端首个内容/推理数据块到达时间，TPOT 为 usage 估算，"
         "SSE 数据块间隔不等于逐 token 时延。N/A 表示不可测或无样本。"
     )
@@ -312,7 +310,12 @@ def generate_markdown(
     ]
 
     for name, actual, required, cmp_fn, must in items:
-        act_str = _fmt_num(actual, ".4f") if isinstance(actual, float) else str(actual)
+        if actual is None:
+            act_str = "None"
+        elif isinstance(actual, float):
+            act_str = _fmt_num(actual, ".4f")
+        else:
+            act_str = str(actual)
         req_str = str(required)
         v = verdict(actual, required, cmp_fn)
         lines.append(f"| {name} | {act_str} | {req_str} | {v} | {must} |")

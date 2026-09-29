@@ -1,8 +1,7 @@
-aiohttp
+# sglang benchmark 客户端所需的依赖（由 sglang 传递依赖）
+# 安装方式见 README：UV_HTTP_TIMEOUT=600 uv pip install sglang
+# 以下为本框架自身额外需要的包（sglang 不包含）
 numpy
 requests
 tqdm
 transformers
-openai
-pydantic
-pyyaml

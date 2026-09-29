@@ -48,25 +48,16 @@ pip install uv
 # 创建虚拟环境（默认 .venv 目录，Python 3.10+）
 uv venv
 
-# 安装依赖（两步）
-# 步骤一：先装 sglang 但跳过其 CUDA/GPU 依赖（本框架只用 sglang 的 benchmark 客户端模块，纯 Python，不需要 GPU 运行时）
-uv pip install sglang --no-deps
+# 安装 sglang（增大超时避免 nvidia-* 大包下载失败）
+UV_HTTP_TIMEOUT=600 uv pip install sglang
 
-# 步骤二：安装框架实际需要的轻量依赖
+# 安装框架额外依赖
 uv pip install -r requirements.txt
 ```
 
-> **为什么用 `--no-deps`？** 完整安装 sglang 会拉取 `nvidia-cuda-*` 等大包（数 GB），本框架只用 `sglang.benchmark.serving` 的 HTTP 客户端和指标计算，不需要 GPU 运行时。跳过后仅安装约 200 MB。
+> sglang 的 `__init__.py` 导入链会拉入服务端运行时（flashinfer、torch 等），无法通过 `--no-deps` 跳过。增大 `UV_HTTP_TIMEOUT` 可解决 nvidia 大包下载超时问题。
 
-<details>
-<summary>完整安装（不推荐，需要稳定网络）</summary>
-
-```bash
-export UV_HTTP_TIMEOUT=600
-uv pip install sglang numpy requests tqdm transformers
-```
-
-</details>
+> 如果 nvidia 包仍然失败，可单独重试：`UV_HTTP_TIMEOUT=600 uv pip install nvidia-cuda-nvdisaml nvidia-cuda-cccl`
 
 ### 3. 激活虚拟环境
 
@@ -123,7 +114,7 @@ DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
 python bench_multi_turn.py \
   --num-sessions 5000 --num-turns 8 --max-tokens-per-turn 256 \
   --system-prompt-len 2048 \
-  --start-tpm 0 --target-tpm 100000000 --avg-tokens-per-request 1024 \
+  --start-tpm 0 --target-tpm 10000 --avg-tokens-per-request 1024 \
   --ramp-seconds 120 --sustain-seconds 600 \
   --max-concurrency 256 \
   --cache-report \
@@ -145,6 +136,8 @@ python bench_multi_turn.py \
   --output-details \
   --tag glm-multiturn-steady
 ```
+
+> **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。模板中加压到 950 RPM（约 16,000 TPM），验收要求 100,000,000 TPM。上例设 `--target-tpm 10000` 为示例值，请根据实际服务能力调整。
 
 ```bash
 # 方式二：不激活虚拟环境，用 uv run（自动使用 .venv）
