@@ -1,10 +1,47 @@
 import argparse
+import os
 from types import SimpleNamespace
 
 from sglang.benchmark.serving import MULTI_TURN_BACKENDS
 
 
-def build_parser():
+def load_env(env_file: str) -> dict:
+    """Parse a .env file into a dict. Returns empty dict if file not found."""
+    values = {}
+    if not env_file or not os.path.isfile(env_file):
+        return values
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if (val.startswith('"') and val.endswith('"')) or (
+                val.startswith("'") and val.endswith("'")
+            ):
+                val = val[1:-1]
+            values[key] = val
+    return values
+
+
+def _preparse_env_file() -> str:
+    """Quick parse to get --env-file before building the full parser."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--env-file", default="configs/.env")
+    ns, _ = pre.parse_known_args()
+    return ns.env_file
+
+
+def build_parser(env: dict = None):
+    env = env or {}
+
+    def _env_default(key, fallback=None):
+        return env.get(key, fallback)
+
     parser = argparse.ArgumentParser(
         description=(
             "多轮长上下文对话压测：复用 sglang.benchmark.serving 内置 HTTP 客户端、"
@@ -13,11 +50,14 @@ def build_parser():
     )
 
     server = parser.add_argument_group("server")
-    server.add_argument("--base-url", type=str, required=True,
-                        help="推理服务地址，例如 http://127.0.0.1:30000")
-    server.add_argument("--model", type=str, default=None,
-                        help="模型名。留空则自动探测 /v1/models")
-    server.add_argument("--backend", type=str, default="sglang-oai-chat",
+    server.add_argument("--base-url", type=str,
+                        default=_env_default("BASE_URL"),
+                        help="推理服务地址，例如 http://127.0.0.1:30000（可从 .env 读取）")
+    server.add_argument("--model", type=str, default=_env_default("MODEL"),
+                        help="模型名。留空则自动探测 /v1/models（可从 .env 读取）")
+    server.add_argument("--api-key", type=str, default=_env_default("API_KEY"),
+                        help="API Key，注入 OPENAI_API_KEY 环境变量供 sglang 客户端使用（可从 .env 读取）")
+    server.add_argument("--backend", type=str, default=_env_default("BACKEND", "sglang-oai-chat"),
                         choices=sorted(MULTI_TURN_BACKENDS),
                         help="多轮仅支持 chat 后端")
     server.add_argument("--header", type=str, nargs="*", default=None,
@@ -28,8 +68,9 @@ def build_parser():
                         help="最大并发请求数，0 表示不限")
 
     dataset = parser.add_argument_group("dataset")
-    dataset.add_argument("--dataset-path", type=str, default="",
-                         help="ShareGPT V3 json 路径，留空自动下载")
+    dataset.add_argument("--dataset-path", type=str,
+                         default=_env_default("DATASET_PATH"),
+                         help="ShareGPT V3 json 路径，留空自动下载（可从 .env 读取）")
     dataset.add_argument("--num-sessions", "--num-prompts", dest="num_sessions",
                          type=int, default=100, help="会话(对话)数量")
     dataset.add_argument("--num-turns", type=int, default=8,
@@ -42,8 +83,9 @@ def build_parser():
                          help="过滤首轮(system+user)加单轮输出超过该长度的会话")
     dataset.add_argument("--min-turns", type=int, default=2,
                          help="仅保留 user 轮数不少于该值的原始对话")
-    dataset.add_argument("--tokenizer", type=str, default=None,
-                         help="tokenizer 名，留空则用 --model")
+    dataset.add_argument("--tokenizer", type=str,
+                         default=_env_default("TOKENIZER"),
+                         help="tokenizer 名，留空则用 --model（可从 .env 读取）")
     dataset.add_argument("--apply-chat-template", action="store_true",
                          help="对每轮 user 文本套用 tokenizer chat template(默认关闭，由服务端模板化)")
 
@@ -113,10 +155,11 @@ def build_parser():
     out.add_argument("--tag", type=str, default="", help="结果 tag")
 
     misc = parser.add_argument_group("misc")
+    misc.add_argument("--env-file", type=str, default="configs/.env",
+                      help=".env 文件路径，自动读取 BASE_URL/MODEL/TOKENIZER/API_KEY/DATASET_PATH 等")
     misc.add_argument("--seed", type=int, default=42)
     misc.add_argument("--print-requests", action="store_true", help="打印每轮请求/响应(调试)")
     return parser
-
 
 def compute_rps(args):
     if args.target_tpm is not None:

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -19,7 +20,7 @@ from sglang.benchmark.serving import (
 )
 from sglang.benchmark.utils import get_tokenizer
 
-from config import build_parser, compute_rps, make_serving_namespace
+from config import build_parser, compute_rps, load_env, make_serving_namespace, _preparse_env_file
 from monitor import DegradationMonitor
 from ramp_scheduler import get_ramp_request
 from report import generate_markdown
@@ -421,10 +422,14 @@ def write_markdown_report(args, metrics_full, metrics_steady,
 
 
 def main():
-    parser = build_parser()
+    env_file = _preparse_env_file()
+    env = load_env(env_file)
+    parser = build_parser(env)
     args = parser.parse_args()
     if not args.base_url:
-        parser.error("--base-url is required")
+        parser.error("--base-url is required (可通过 configs/.env 或 --base-url 提供)")
+    if args.api_key:
+        os.environ["OPENAI_API_KEY"] = args.api_key
     np.random.seed(args.seed)
     return asyncio.run(run_benchmark(args))
 

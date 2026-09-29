@@ -29,21 +29,29 @@
 
 ```bash
 pip install sglang            # >= 0.5.10
-# serving.py 内置客户端从环境变量读 API Key
-export API_KEY=xxxx            # 或 export OPENAI_API_KEY=xxxx
 ```
+
+## 配置（configs/.env）
+
+框架自动读取 `configs/.env` 文件获取服务地址、模型名、tokenizer、API Key、数据集路径等参数，避免命令行过长。
+
+```bash
+# 1. 复制模板
+cp configs/.env.example configs/.env
+
+# 2. 编辑 configs/.env，填入实际值
+BASE_URL=http://127.0.0.1:30000
+MODEL=glm-5.3
+TOKENIZER=/path/to/tokenizer
+API_KEY=sk-xxxxx                          # 需要鉴权时填写，自动注入 OPENAI_API_KEY
+DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
+```
+
+> `.env` 已在 `.gitignore` 中，不会被提交。CLI 参数会覆盖 `.env` 同名值。
 
 ## 数据集
 
-框架使用 `ShareGPT_V3_unfiltered_cleaned_split.json`。**必须通过 `--dataset-path` 指定本地路径**：
-
-```bash
-python bench_multi_turn.py \
-  --base-url http://127.0.0.1:30000 \
-  --tokenizer meta-llama/Meta-Llama-3-8B-Instruct \
-  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
-  ...
-```
+框架使用 `ShareGPT_V3_unfiltered_cleaned_split.json`。推荐在 `configs/.env` 中设置 `DATASET_PATH`，也可通过 `--dataset-path` 指定：
 
 > 数据文件**不需要**放入仓库路径，用绝对路径或相对路径指定即可。如果不传 `--dataset-path`，框架会尝试从 HuggingFace 自动下载（需网络连通）。
 
@@ -51,16 +59,12 @@ python bench_multi_turn.py \
 
 ## 用法示例
 
-### 推荐命令（完整满足压测需求）
+### 推荐命令（.env + 精简 CLI）
 
-一条命令覆盖全部 3 条需求：ShareGPT 全多轮数据（去重+每会话唯一 system prompt 防缓存命中）→ TPM 匀速爬坡至稳态 → 稳态期持续多轮对话压测并只记录稳态指标 → 检测衰减信号自动终止并输出报告。
+配置好 `configs/.env` 后，命令行只需传压测参数：
 
 ```bash
 python bench_multi_turn.py \
-  --base-url http://127.0.0.1:30000 \
-  --model glm-5.3 \
-  --tokenizer /path/to/tokenizer \
-  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
   --num-sessions 5000 --num-turns 8 --max-tokens-per-turn 256 \
   --system-prompt-len 2048 \
   --start-tpm 0 --target-tpm 100000000 --avg-tokens-per-request 1024 \
@@ -86,12 +90,14 @@ python bench_multi_turn.py \
   --tag glm-multiturn-steady
 ```
 
+> `--base-url`、`--model`、`--tokenizer`、`--api-key`、`--dataset-path` 自动从 `configs/.env` 读取，CLI 同名参数可覆盖。
+
 命令逐段对应需求：
 
 | 参数 | 对应需求 |
 |---|---|
-| `--dataset-path ...ShareGPT_V3...json` | 需求1：ShareGPT 数据集（本地指定路径） |
-| `--num-sessions 5000`（去重后不足会报错） | 需求1：压测容量 |
+| `.env` 中 `DATASET_PATH`（去重后不足会报错） | 需求1：ShareGPT 数据集 + 压测容量 |
+| `--num-sessions 5000` | 需求1：压测容量 |
 | `--system-prompt-len 2048`（每会话唯一随机） | 需求1：防缓存命中 + 长上下文 |
 | `--start-tpm 0 --target-tpm 100000000 --ramp-seconds 120` | 需求2：起压点匀速爬坡至目标稳态 |
 | `--sustain-seconds 600` | 需求2：稳态后持续压测 |
@@ -110,9 +116,6 @@ python bench_multi_turn.py \
 
 ```bash
 python bench_multi_turn.py \
-  --base-url http://127.0.0.1:30000 \
-  --tokenizer meta-llama/Meta-Llama-3-8B-Instruct \
-  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
   --num-sessions 200 --num-turns 8 \
   --start-rps 0 --target-rps 5 --ramp-seconds 60 \
   --max-concurrency 128
@@ -122,8 +125,6 @@ python bench_multi_turn.py \
 
 ```bash
 python bench_multi_turn.py \
-  --base-url http://127.0.0.1:30000 --tokenizer meta-llama/Meta-Llama-3-8B-Instruct \
-  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
   --num-sessions 100 --num-turns 8 --max-tokens-per-turn 512 \
   --target-rps 2 --ignore-eos --disable-monitor
 ```
@@ -132,10 +133,12 @@ python bench_multi_turn.py \
 
 | 参数 | 说明 |
 |---|---|
-| `--base-url` | 推理服务地址（必填） |
-| `--model` | 模型名，留空自动探测 `/v1/models` |
-| `--tokenizer` | tokenizer 名/路径，留空则用 `--model` |
-| `--dataset-path` | ShareGPT V3 JSON 路径（推荐本地指定） |
+| `--env-file` | .env 文件路径（默认 `configs/.env`），自动读取服务/模型/数据集配置 |
+| `--base-url` | 推理服务地址（可从 .env 读取） |
+| `--model` | 模型名，留空自动探测 `/v1/models`（可从 .env 读取） |
+| `--api-key` | API Key，自动注入 `OPENAI_API_KEY` 环境变量（可从 .env 读取） |
+| `--tokenizer` | tokenizer 名/路径，留空则用 `--model`（可从 .env 读取） |
+| `--dataset-path` | ShareGPT V3 JSON 路径（可从 .env 读取） |
 | `--num-sessions` | 会话数（每次发一个完整多轮对话） |
 | `--num-turns` | 每会话轮数；上下文随轮次线性增长 |
 | `--max-tokens-per-turn` | 每轮生成 max_tokens 上限 |
