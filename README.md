@@ -48,9 +48,25 @@ pip install uv
 # 创建虚拟环境（默认 .venv 目录，Python 3.10+）
 uv venv
 
-# 安装全部依赖（读取 requirements.txt）
+# 安装依赖（两步）
+# 步骤一：先装 sglang 但跳过其 CUDA/GPU 依赖（本框架只用 sglang 的 benchmark 客户端模块，纯 Python，不需要 GPU 运行时）
+uv pip install sglang --no-deps
+
+# 步骤二：安装框架实际需要的轻量依赖
 uv pip install -r requirements.txt
 ```
+
+> **为什么用 `--no-deps`？** 完整安装 sglang 会拉取 `nvidia-cuda-*` 等大包（数 GB），本框架只用 `sglang.benchmark.serving` 的 HTTP 客户端和指标计算，不需要 GPU 运行时。跳过后仅安装约 200 MB。
+
+<details>
+<summary>完整安装（不推荐，需要稳定网络）</summary>
+
+```bash
+export UV_HTTP_TIMEOUT=600
+uv pip install sglang numpy requests tqdm transformers
+```
+
+</details>
 
 ### 3. 激活虚拟环境
 

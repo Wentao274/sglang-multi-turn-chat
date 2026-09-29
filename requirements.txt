@@ -1,5 +1,8 @@
-sglang>=0.5.10
+aiohttp
 numpy
 requests
 tqdm
 transformers
+openai
+pydantic
+pyyaml
