@@ -389,7 +389,7 @@ def test_generate_markdown_cache_metrics():
     print("PASS: generate_markdown steady cache hit = 210/320 = 0.6563")
 
 
-def _mk_args():
+def _mk_args(*extra):
     """构建与 bench_multi_turn 一致的 args（供 generate_markdown 测试使用）。"""
     import argparse
     from config import build_parser, load_env, _preparse_env_file
@@ -403,7 +403,7 @@ def _mk_args():
         "--dataset-path", "nonexistent.json",
         "--ramp-seconds", "10",
         "--sustain-seconds", "10",
-    ])
+    ] + list(extra))
 
 
 def test_round_breakdown_no_cache_flag():
@@ -448,6 +448,42 @@ def test_round_breakdown_cold_round_zero():
     print(f"PASS: cold round0 hit=0.00 (measurable), round1 hit={rows[1][6]:.4f}")
 
 
+def test_tpm_concurrency_judgments():
+    """新指标判断：TPM ≥ 1亿 判定通过；并发仅显示数值（信息项，不判定）。"""
+    s = RequestFuncOutput(success=True, prompt_len=5000, output_len=170,
+                         ttft=0.05, latency=5.0)
+    s.prompt_tokens_actual = 5170  # server-reported
+    s.cached_tokens = 1000
+    s.cached_tokens_details = {"cached_tokens": 1000}
+    args = _mk_args("--accept-steady-tpm", "100000000",
+                   "--accept-peak-concurrency", "1000")
+    md = report.generate_markdown(
+        args, BenchmarkMetrics(completed=2, total_output=90),
+        BenchmarkMetrics(completed=2, total_output=90),
+        [[s]], [[s]],
+        wall_dur=10.0, steady_dur=10.0, steady_sessions=1, ramp_sessions=0,
+        terminated=False, termination_reason=None,
+        monitor_history=[], cum_429=0,
+        backend="sglang", model="test-model",
+        target_rps=1.0, start_rps=0.1, output_lens=[170],
+        peak_concurrency=1000,
+    )
+    # 稳态 TPM = (5170+170)/10*60 = 320,400 < 1亿 → 不通过
+    tpm_row = [l for l in md.split("\n") if "稳态TPM" in l]
+    assert any("不通过" in l for l in tpm_row), f"TPM row should fail: {tpm_row}"
+    # 并发为信息项：显示数值，结论列 = "—"，无 通过/不通过
+    conc_row = [l for l in md.split("\n") if "并发数" in l]
+    assert conc_row and "| — |" in conc_row[0], f"concurrency info row: {conc_row}"
+    assert not any("通过" in l or "不通过" in l for l in conc_row), \
+        f"info row must not be judged: {conc_row}"
+    # 全程表：peak_concurrency = 1000
+    assert "| peak_concurrency | 1000 |" in md, "peak_concurrency not in full table"
+    # 验收明细：信息项（要求 — / 结论 N/A）
+    acc = [l for l in md.split("\n") if l.startswith("| peak_concurrency |") and "—" in l]
+    assert acc and "| N/A | 信息项 |" in acc[0], f"info acceptance: {acc}"
+    print("PASS: TPM judged, concurrency shown as informational value")
+
+
 def test_generate_markdown_flag_off_shows_na():
     """服务端未开 --enable-cache-report。
 
@@ -490,4 +526,5 @@ if __name__ == "__main__":
     test_round_breakdown_cold_round_zero()
     test_generate_markdown_cache_metrics()
     test_generate_markdown_flag_off_shows_na()
+    test_tpm_concurrency_judgments()
     print("\nAll smoke tests passed.")

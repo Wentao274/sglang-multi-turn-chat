@@ -2,6 +2,8 @@
 
 多轮长上下文对话压测框架。复用 `sglang.benchmark.serving` 内置多轮 wrapper 与指标计算；HTTP 客户端为内置客户端的 fork（`request_client.py`），自动解析 `usage.prompt_tokens_details.cached_tokens`，统计真实 prefix cache 命中率。使用 `ShareGPT_V3_unfiltered_cleaned_split.json` 全多轮数据；TPM 匀速爬坡至目标稳态后持续压测，检测衰减信号自动终止并输出 Markdown 报告。
 
+**客户指标**：稳态 TPM ≥ 1 亿（100,000,000 tokens/min）即通过；并发请求数（上限 1000）作为 1 亿吞吐下的参考值展示，不参与判定。详见「测试逻辑与判断逻辑」章节。
+
 报告格式对齐客户模板 `reports-temp.md`，开头输出**测试结论汇总**（客户 6 项指标通过/不通过 + 总体结论），后接 9 个章节：全程、连续稳态、验收明细、全程分轮、稳态分轮、stream/full_run、stream/steady、加压时间序列、实际长度与轮数。
 
 ## 架构
@@ -9,13 +11,14 @@
 | 文件 | 职责 |
 |---|---|
 | `bench_multi_turn.py` | 主入口：编排加载→预热→爬坡调度→采集→监控→出报告，复用 serving.py 零件 |
-| `sharegpt_multiturn.py` | ShareGPT V3 → `List[DatasetRow]`，去重保证会话不重复、每会话唯一 system prompt（不同连续会话内容不同），会话内多轮连续命中缓存 |
+| `build_multiturn_dataset.py` | 可选工具：false_qa / truthful_qa / dolly（每 N 条 QA 串成多轮会话）+ TM（从 gpt 文本解析真实多轮）→ 与 ShareGPT 合并输出统一 JSON（当前测试未使用，保留备用） |
+| `sharegpt_multiturn.py` | ShareGPT 格式 JSON → `List[DatasetRow]`，去重保证会话不重复、每会话唯一 system prompt（不同连续会话内容不同），会话内多轮连续命中缓存 |
 | `request_client.py` | sglang 内置 OpenAI 流式客户端的 fork：附带 `stream_options.include_usage`，解析 `usage.prompt_tokens`（真实输入 token）与 `prompt_tokens_details.cached_tokens`（真实 prefix cache 命中） |
 | `probe_cache_report.py` | 压测前探测脚本：发两个请求验证服务端响应是否返回 `cached_tokens` 字段（确认服务端已开 `--enable-cache-report`） |
 | `ramp_scheduler.py` | 非齐次泊松请求生成器：RPS 从 `start` 线性爬升到 `target`，稳态后持续压测 |
 | `monitor.py` | 衰减监控器 + 时间序列快照采集：滑动窗口检测错误率/吞吐跌落/TTFT 飙升；全程记录 RPM/TPM/延迟快照 |
 | `config.py` | 参数解析 + 把本框架参数映射成 serving.py 内置客户端读取的全局 `args` |
-| `report.py` | 生成 Markdown 压测报告：测试结论汇总（6 项客户指标）+ 9 个章节对齐客户模板 |
+| `report.py` | 生成 Markdown 压测报告：测试结论汇总（7 项判定 + 并发信息项）+ 10 个章节对齐客户模板 |
 | `test_cached_client.py` | 烟雾测试：mock sglang 服务端 + SSE 流，验证 cached_tokens/prompt_tokens_actual 解析与报告计算 |
 
 被复用的 sglang 内置组件（不重造轮子）：
@@ -101,9 +104,44 @@ DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
 
 ## 数据集
 
-框架使用 `ShareGPT_V3_unfiltered_cleaned_split.json`。推荐在 `configs/.env` 中设置 `DATASET_PATH`，也可通过 `--dataset-path` 指定：
+框架使用 `ShareGPT_V3_unfiltered_cleaned_split.json` 单一数据集。推荐在 `configs/.env` 中设置 `DATASET_PATH`，也可通过 `--dataset-path` 指定：
 
-> 数据文件**不需要**放入仓库路径，用绝对路径或相对路径指定即可。如果不传 `--dataset-path`，框架会尝试从 HuggingFace 自动下载（需网络连通）。
+**容量（min_turns=2、首轮去重后）：51,493 条可用会话**——满足推荐测试参数（`--num-sessions 50000` 可加载，900s 窗口实际消耗约 36,500 会话，余量充足）。
+
+> 数据文件**不需要**放入仓库路径，用绝对路径或相对路径指定即可。如果不传 `--dataset-path`，框架会尝试从 HuggingFace 自动下载（仅 ShareGPT，需网络连通）。
+
+### 多数据集合并（build_multiturn_dataset.py，可选工具）
+
+4 个补充数据集均为单轮，通过 `build_multiturn_dataset.py` 转换为多轮会话并与 ShareGPT 合并：
+
+| 数据集 | 原始格式 | 转换策略 | 可用会话 |
+|---|---|---|---|
+| `false_qa.jsonl` | UltraFeedback（单轮 QA，2,339 条） | 每条问题作为一个 user 轮，assistant 轮取评分最高的模型回答 | 纳入 QA 池 |
+| `truthful_qa.jsonl` | UltraFeedback（单轮 QA，811 条） | 同上 | 纳入 QA 池 |
+| `databricks-dolly-15k.jsonl` | Dolly（单轮指令，15,011 条） | instruction 作为 user 轮，带 context 的前置拼入（`Context:\n...\n\nInstruction: ...`） | 纳入 QA 池 |
+| `TM_multi_turn_convs_split_token_wrap.jsonl` | ShareGPT 格式但单轮（281 条） | 真实多轮对话嵌在 gpt 回复文本内（`**User:**`/`**AI Assistant:**` 标签），正则解析还原 | 273 条真实多轮 |
+
+QA 池（false_qa 2,339 + truthful_qa 811 + dolly 去重后 14,822 = 17,972 条）随机打散后**每 6 条串成一个多轮会话**（`--qa-per-session` 可调），加上 TM 解析的 273 条 → 新增 **3,269 条**多轮会话，与 ShareGPT 原始 94,145 条合并（随机 shuffle）输出单一 JSON 文件。
+
+```bash
+# 生成合并数据集（默认输入目录 D:\Maas\芯片测试\测试相关\测试数据集）
+python build_multiturn_dataset.py \
+  --input-dir "D:\Maas\芯片测试\测试相关\测试数据集" \
+  --qa-per-session 6 \
+  --output merged_multiturn.json
+
+# 仅转换新数据集（不合并 ShareGPT，快速检查转换结果）
+python build_multiturn_dataset.py --no-sharegpt --output converted_only.json
+```
+
+合并结果（min_turns≥2、首轮去重后可用会话数）：
+
+| 数据集 | 可用会话（≥2 轮） |
+|---|---|
+| **纯 ShareGPT（当前使用）** | **51,493** |
+| 合并后（可选） | 54,756（ShareGPT 51,493 + 新增 3,263） |
+
+> **容量结论**：推荐测试参数（1.2 亿 TPM 加压、8192 system prompt、爬坡 300s + 稳态 600s）下 900s 窗口实际消耗约 **36,500 会话**（48.7 会话/s × 750s 等效满速窗口）——纯 ShareGPT（51,493）**完全满足**；`--num-sessions 50000` 可正常加载。当前测试仅使用 ShareGPT 单一数据集；`build_multiturn_dataset.py` 保留为可选工具，如需数据源多样性可随时生成合并数据集（生成后把 `DATASET_PATH` 指向 `merged_multiturn.json` 即可）。
 
 **容量与防缓存保证**：加载时按首轮 user 文本做 md5 去重，确保会话内容不重复；`--system-prompt-len > 0` 时每个会话生成**独立随机** system prompt，不同连续会话内容不同，避免跨会话缓存一直命中；同一会话内多轮内容连续（每轮重发完整历史，prefix 与上一轮重合），命中缓存越高效率越高（测试指标）。若去重+过滤后可用会话数 < `--num-sessions`，直接报错并提示调整参数（不靠重复凑数）。`--sustain-seconds` 设定时，框架会预估所需会话数并在不足时给出警告。
 
@@ -131,6 +169,45 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 
 压测前可用 `python probe_cache_report.py` 一条命令验证服务端确实返回该字段（详见"压测前探测缓存命中率字段"章节）。
 
+## 测试逻辑与判断逻辑（新指标：TPM 1亿 + 并发 1000）
+
+### 指标口径
+
+- **稳态 TPM** = 稳态窗口内（爬坡结束后才发起首轮的会话）所有成功请求的（服务端报告输入 tokens + 输出 tokens）总和 ÷ 稳态时长 × 60。输入+输出合并计：多轮每轮重发完整历史，输入占大头，正是 prefix cache 优化的场景。
+- **峰值并发**（`peak_concurrency`）= 信号量占用数（实际同时在执行的会话数，每个会话同一时刻只有 1 个在途 HTTP 请求），即服务端视角的真实峰值并发请求数。注意与监控快照中的 `inflight`（含排队等待信号量的会话）不同。
+
+### 测试逻辑
+
+1. **加压**：`--start-tpm 0 --target-tpm 120000000`，TPM 从零匀速爬坡至 1.2 亿（`--ramp-seconds`），之后持续压测（`--sustain-seconds`）。加压目标高于 1 亿验收线是**有意为之**：RPS 调度按计划 token（256/轮）估算，而模型自然停止实际输出 ≈170/轮，实际 TPM 低于计划值，若加压目标=验收线，服务端跟得上也会被客户端调度限在 1 亿以下（详见 TPM 校准提示）。
+2. **并发封顶**：`--max-concurrency 1000`。服务端跟不上时请求在客户端信号量排队，服务端最多同时收到 1000 个在途请求；报告展示 1 亿吞吐下实际压到的并发数（`peak_concurrency`，信息项）。
+3. **会话池**：1.2 亿 TPM 下会话消耗极快（~49 会话/s），需要 `--min-turns 2`（ShareGPT 去重后 51,493 条）+ `--num-sessions 50000` 的池子；配合 `--system-prompt-len 8192` 增大每会话 token 数（平均 ~41,101 tokens/会话）以降低会话消耗速率（~49 会话/s，50K 池可支撑完整 900s 窗口（消耗 ~36,500）。若启动时出现容量警告，按提示缩短 `--sustain-seconds` 或减小 `--target-tpm`。
+4. **稳态窗口**：仅统计爬坡结束后才发起首轮的会话；TPM 与延迟指标均取该窗口。
+5. **衰减保护**：监控滑动窗口错误率 / 吞吐跌落 / TTFT p99，超阈值自动终止（防止压垮服务端）。
+
+### 判断逻辑
+
+| 指标 | 计算 | 判定 |
+|---|---|---|
+| `steady_tpm` | (稳态输入+输出 tokens) / 稳态时长 × 60 | ≥ `--accept-steady-tpm`（1 亿）→ **通过** |
+
+- **TPM 是唯一的新增验收指标**：稳态 TPM ≥ 1 亿即通过（连同既有 6 项：吞吐/TTFT/TPOT/缓存命中）。
+- **峰值并发为信息项（不判定）**：报告显示「1 亿 TPM 下并发数」的实际数值（如 1 亿 TPM 时并发 850），无论是否达到 1000 都不影响通过/不通过结论——客户只关心吞吐达标，并发数作为该吞吐下的参考值展示。
+
+判定矩阵（一次性测试，不通过即出结论，不重测）：
+
+| 稳态TPM | 结论 |
+|---|---|
+| ≥ 1亿 | **通过**（报告同时展示该吞吐下的并发数作为参考） |
+| < 1亿 | 不通过：服务端能力不足或加压不够，检查衰减终止原因 |
+
+### TPM 校准提示
+
+- `--target-tpm` 是加压目标（计划发送速率）；`actual_tpm_stable` 是服务端实际处理速率（验收依据）。默认（无 `--ignore-eos`）模型自然停止，实际输出 ≈170 tokens/轮（低于计划的 256），**实际 TPM < 计划 TPM**：8192 system prompt 占大头的推荐配置下 ≈ 计划的 ~99%，输出占比更高的场景可低至 ~85%。
+- 因此推荐 `--target-tpm 120000000`（加压目标）+ `--accept-steady-tpm 100000000`（验收线）：无论校准比例是 85% 还是 99%，实际稳态 TPM 都能越过 1 亿验收线（85% → 1.02 亿，99% → 1.19 亿）；若服务端容量不足，实际 TPM 体现真实瓶颈，仍按验收线判定。
+- 测试为一次性判定（不重测）：不通过即出最终结论。
+- `--max-concurrency`（推荐 1000）仍生效：限制同时在途的请求数，报告展示 1 亿吞吐下实际压到的并发数（`peak_concurrency`）作为参考。
+- 若要求计划=实际（每轮固定 256 输出），加 `--ignore-eos`（但不模拟真实对话，不推荐用于客户验收场景）。
+
 ## 用法示例
 
 ### 推荐命令（.env + 精简 CLI）
@@ -140,11 +217,12 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 ```bash
 # 方式一：配置好环境，直接运行
 python bench_multi_turn.py \
-  --num-sessions 1000 --num-turns 14 --min-turns 8 --max-tokens-per-turn 256 \
-  --system-prompt-len 2048 \
-  --start-tpm 0 --target-tpm 214000 \
+  --num-sessions 50000 --num-turns 14 --min-turns 2 \
+  --system-prompt-len 8192 \
+  --max-tokens-per-turn 256 \
+  --start-tpm 0 --target-tpm 120000000 \
   --ramp-seconds 300 --sustain-seconds 600 \
-  --max-concurrency 500 \
+  --max-concurrency 1000 \
   --cache-report \
   --max-error-rate 0.10 \
   --throughput-drop-ratio 0.3 \
@@ -152,6 +230,7 @@ python bench_multi_turn.py \
   --baseline-warmup-seconds 120 \
   --monitor-window 30 --monitor-interval 10 \
   --accept-steady-tpm 100000000 \
+  --accept-peak-concurrency 1000 \
   --accept-request-rps 0.6 \
   --accept-success-rate 0.995 \
   --accept-ttft-p50-ms 8000 \
@@ -164,104 +243,87 @@ python bench_multi_turn.py \
   --output-file result.jsonl \
   --report-md report.md \
   --output-details \
-  --tag glm-multiturn-steady
+  --tag glm-100m-tpm-1000conc
 ```
 
-> **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。`--avg-tokens-per-request` 默认 0=自动估算（从数据集每会话的轮数和 token 长度推算），无需手动设置。`--target-tpm 214000` 基于上次测试服务端实测容量 267K TPM 的 80% 安全余量。
+> **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。`--avg-tokens-per-request` 默认 0=自动估算（从数据集每会话的轮数和 token 长度推算），无需手动设置。推荐配置 `--target-tpm 120000000 --accept-steady-tpm 100000000`——加压目标比 1 亿验收线高 20%，覆盖输出自然停止造成的实际<计划偏差（见下）。
 >
-> **TPM 校准提示**：默认（无 `--ignore-eos`）模型自然停止，实际输出 ≈170 tokens/轮（低于计划的 256），RPS 调度按计划 token 估算，因此**实际 TPM ≈ 计划 TPM 的 85%**。若需精确压到指定实际负载，首跑后读报告 `actual_tpm_stable` 按比例上调 `--target-tpm`（如需实际 214K → 设 250K）；若要求计划=实际（每轮固定 256 输出），加 `--ignore-eos`（但不模拟真实对话）。
+> **TPM 校准提示**：默认（无 `--ignore-eos`）模型自然停止，实际输出 ≈170 tokens/轮（低于计划的 256），RPS 调度按计划 token 估算，因此**实际 TPM < 计划 TPM**（~85%-99%，取决于输入/输出构成）。加压目标 1.2 亿保证实际稳态 TPM ≥ 1 亿验收线。测试为一次性判定（不重测），实际压到的负载以报告 `actual_tpm_stable` 为准。
 
 ```bash
 # 方式二：不激活虚拟环境，用 uv run（自动使用 .venv）
-uv run python bench_multi_turn.py --num-sessions 1000 --num-turns 14 --min-turns 8 ...
+uv run python bench_multi_turn.py --num-sessions 50000 --num-turns 14 --min-turns 2 ...
 ```
 
 > `--base-url`、`--model`、`--tokenizer`、`--api-key`、`--dataset-path` 自动从 `configs/.env` 读取，CLI 同名参数可覆盖。
 
 ### 推荐命令参数详解
 
-推荐命令共 29 个参数，按功能分为 6 组：
+推荐命令共 33 个参数，按功能分为 6 组：
 
 **数据集参数（需求1：数据集 + 容量 + 防重复）**
 
 | 参数 | 示例值 | 含义 |
 |---|---|---|
-| `--num-sessions` | `1000` | 加载的会话（对话）总数；去重后不足会直接报错。900s 窗口按计划仅消费 ~60-70 个会话（0.063 sessions/s），1000 已有 15 倍余量且显著缩短加载/分词时间 |
-| `--num-turns` | `14` | 每会话最大轮数上限；自然轮数不足此值的会话按实际轮数执行 |
-| `--min-turns` | `8` | 仅保留 user 轮数 ≥ 该值的原始对话（过滤门槛）；去重后 5,281 条满足 ≥8 轮 |
-| `--max-tokens-per-turn` | `256` | 每轮 API 请求的 max_tokens 上限 |
-| `--system-prompt-len` | `2048` | 每会话生成独立随机 system prompt 的 token 长度（防缓存命中 + 首轮即长上下文） |
+| `--num-sessions` | `50000` | 加载的会话（对话）总数；去重后不足会直接报错并提示调整参数 |
+| `--num-turns` | `14` | 每会话最大对话轮数上限；自然轮数不足此值的会话按实际轮数执行 |
+| `--min-turns` | `2` | 仅保留 user 轮数 ≥ 该值的原始对话（过滤门槛）；ShareGPT 去重后 51,493 条满足 ≥2 轮 |
+| `--max-tokens-per-turn` | `256` | 每次 API 请求的 max_tokens 上限 |
+| `--system-prompt-len` | `8192` | 每会话生成独立随机 system prompt 的 token 长度（防缓存命中 + 首轮即长上下文）；同时增大每会话 token 数，降低会话消耗速率 |
 | `--num-shared-prefixes` | （未传，默认 0） | 共享 system prompt 组数；默认 0=每会话唯一前缀（不同连续会话内容不同，符合客户要求）；>0=按 round-robin 分配共享前缀（跨会话也命中，非推荐模式） |
 
-**压测调度参数（需求2：起压点爬坡至稳态）**
+**压测调度参数（需求2：起压点匀速爬坡至稳态）**
 
 | 参数 | 示例值 | 含义 |
 |---|---|---|
 | `--start-tpm` | `0` | 爬坡起始 TPM（tokens/分钟），0 表示从零起压 |
-| `--target-tpm` | `214000` | 稳态目标 TPM；按 avg-tokens-per-request 折算为会话发送速率 RPS |
-| `--avg-tokens-per-request` | （未传，默认 0） | TPM→RPS 折算系数；0=自动从数据集按轮数和 token 长度估算每会话总 token 数 |
-| `--ramp-seconds` | `300` | RPS 从 start 线性爬升到 target 的时长（秒） |
+| `--target-tpm` | `120000000` | 稳态目标 TPM，按 avg-tokens-per-request 折算为会话发送速率 RPS |
+| `--avg-tokens-per-request` | （未传，默认 0） | TPM→RPS 折算系数；0=自动从数据集按每会话总 token 数估算 |
+| `--ramp-seconds` | `300` | TPM 从 start 线性爬升到 target 的时长（秒） |
 | `--sustain-seconds` | `600` | 到达稳态后持续压测时长（秒）；爬坡+稳态共 900s |
 
 **并发控制**
 
 | 参数 | 示例值 | 含义 |
 |---|---|---|
-| `--max-concurrency` | `500` | 最大并发会话数（信号量上限），超过则新会话排队等待 |
+| `--max-concurrency` | `1000` | 最大并发会话数（信号量上限），超过则新会话排队等待 |
 
 **衰减监控参数（需求3：异常/衰减终止）**
 
 | 参数 | 示例值 | 含义 |
 |---|---|---|
-| `--max-error-rate` | `0.10` | 滑动窗口错误率阈值，达到即终止测试；验收要求错误率 ≤0.5%，0.10（30 样本窗口中 3 个错误）即可快速止损，避免为注定不通过的测试白烧时间 |
+| `--max-error-rate` | `0.10` | 滑动窗口错误率阈值，达到即终止测试（验收要求错误率 ≤0.5%，0.10 可快速止损） |
 | `--throughput-drop-ratio` | `0.3` | 窗口吞吐跌至稳态基线的 30% 即终止（崩溃级兜底） |
-| `--max-ttft-p99-ms` | `60000` | 窗口 TTFT p99 毫秒阈值，超过即终止；设为验收线（30s）的 2 倍——30s 窗口内 p99≈前两大值，若卡在 30s 会因 2 个慢请求提前杀死本可通过验收（p95≤30s 允许 5% 超标）的测试 |
+| `--max-ttft-p99-ms` | `60000` | 窗口 TTFT p99 阈值，超过即终止；为验收线（30s）的 2 倍——30s 窗口内 p99≈前两大值，若卡在 30s 会因 2 个慢请求提前杀死本可通过验收（p95≤30s 允许 5% 超标）的测试 |
 | `--baseline-warmup-seconds` | `120` | 进入稳态后等待该时长再锁定吞吐基线（避开爬坡完成波，防误判） |
 | `--monitor-window` | `30` | 衰减检测滑动窗口时长（秒） |
 | `--monitor-interval` | `10` | 监控检查间隔（秒） |
-| `--cache-report` | （开关） | 兼容保留：sglang 内置客户端需此开关才解析 cached_tokens；本框架 fork（`request_client.py`）已无条件解析 usage，无需此开关 |
+| `--cache-report` | （开关） | 采集 prefix cache 命中统计（sglang 服务端需开 --enable-cache-report） |
 
-**验收要求参数（报告"验收明细"与"测试结论汇总"章节的要求值）**
+**验收要求参数（报告"测试结论汇总"与"验收明细"章节的要求值）**
 
 | 参数 | 示例值 | 含义 |
 |---|---|---|
-| `--accept-steady-tpm` | `100000000` | 要求：稳态实际 TPM ≥ 该值 |
-| `--accept-request-rps` | `0.6` | 要求：稳态请求吞吐 ≥ 该值（轮次/秒） |
-| `--accept-success-rate` | `0.995` | 要求：稳态成功率 ≥ 该值 |
-| `--accept-ttft-p50-ms` | `8000` | 要求：稳态 TTFT p50 ≤ 该值（毫秒） |
-| `--accept-ttft-p95-ms` | `30000` | 要求：稳态 TTFT p95 ≤ 该值（毫秒） |
-| `--accept-tpot-p50-ms` | `30` | 要求：稳态 TPOT p50 ≤ 该值（毫秒） |
-| `--accept-tpot-p95-ms` | `45` | 要求：稳态 TPOT p95 ≤ 该值（毫秒） |
-| `--accept-cache-hit-rate` | `0.6` | 要求：稳态 prefix cache 命中率 ≥ 该值 |
-| `--accept-zero-429` | `0` | 要求：429 限流次数 ≤ 该值 |
-| `--accept-usage-complete` | `1` | 要求：usage 字段完整（每轮都有 usage 返回） |
+| `--accept-steady-tpm` | `100000000` | 验收要求：稳态 TPM ≥ 1 亿 |
+| `--accept-peak-concurrency` | `1000` | 信息项：报告展示 1 亿 TPM 下实际压到的并发数（不参与通过/不通过判定） |
+| `--accept-request-rps` | `0.6` | 验收要求：稳态 RPS |
+| `--accept-success-rate` | `0.995` | 验收要求：成功率 |
+| `--accept-ttft-p50-ms` | `8000` | 验收要求：TTFT p50 |
+| `--accept-ttft-p95-ms` | `30000` | 验收要求：TTFT p95 |
+| `--accept-tpot-p50-ms` | `30` | 验收要求：TPOT p50 |
+| `--accept-tpot-p95-ms` | `45` | 验收要求：TPOT p95 |
+| `--accept-cache-hit-rate` | `0.6` | 验收要求：稳态 cache hit rate |
+| `--accept-zero-429` | `0` | 验收要求：429 次数上限 |
+| `--accept-usage-complete` | `1` | 验收要求：usage 完整（1=必须） |
 
 **输出参数**
 
 | 参数 | 示例值 | 含义 |
 |---|---|---|
-| `--output-file` | `result.jsonl` | JSONL 结果文件名（自动放入 `results/{模型}-{时间戳}/` 子目录） |
-| `--report-md` | `report.md` | Markdown 报告文件名（自动放入同上子目录） |
-| `--output-details` | （开关） | JSONL 中附带每请求的 input_lens/ttfts/itls/errors/cached_tokens/prompt_tokens_actual 明细（每轮会话的真实缓存命中数据） |
-| `--tag` | `glm-multiturn-steady` | 测试标签，写入 JSONL 便于归档检索 |
-
-命令逐段对应需求：
-
-| 参数 | 对应需求 |
-|---|---|
-| `.env` 中 `DATASET_PATH`（去重后不足会报错） | 需求1：ShareGPT 数据集 + 压测容量 |
-| `--num-sessions 1000` | 需求1：压测容量 |
-| `--system-prompt-len 2048` | 需求1：长上下文；每会话唯一随机前缀（不同连续会话内容不同），会话内多轮连续命中缓存（测试指标：越高效率越高） |
-| `--start-tpm 0 --target-tpm 214000 --ramp-seconds 300` | 需求2：起压点匀速爬坡至目标稳态 |
-| `--sustain-seconds 600` | 需求2：稳态后持续压测 |
-| 指标自动只统计 `start_time >= 爬坡结束` 的会话 | 需求2：从稳态开始记录指标 |
-| `--max-error-rate / --throughput-drop-ratio / --max-ttft-p99-ms` | 需求3：异常/衰减信号终止 |
-| `--baseline-warmup-seconds 120` | 需求3：稳态建基线后才开始判定 |
-| 终止后自动写 `result.jsonl` + `report.md`（含 9 章节报告） | 需求3：终止即输出报告 |
-| `--cache-report` | 采集 prefix cache 命中率（fork 客户端默认已开，flag 仅兼容内置客户端） |
-| `--accept-*` 系列参数 | 测试结论汇总 + 验收明细表的要求值（客户指标：吞吐 ≥0.6 req/s、TTFT P50 ≤8s/P95 ≤30s、TPOT P50 ≤30ms/P95 ≤45ms、cache hit ≥60%） |
-
-调整 `--target-tpm`、`--num-sessions`、`--sustain-seconds` 即可适配不同压测目标。`--avg-tokens-per-request` 默认 0=自动从数据集估算每会话总 token 数，无需手动设置。
+| `--output-file` | `result.jsonl` | JSONL 结果文件名（自动放入输出子目录） |
+| `--report-md` | `report.md` | Markdown 报告文件名（自动放入输出子目录） |
+| `--output-details` | （开关） | JSONL 中附带每轮明细（input_lens/ttfts/itls/errors/cached_tokens/prompt_tokens_actual） |
+| `--tag` | `glm-100m-tpm-1000conc` | 结果 tag，写入 JSONL 便于归档检索 |
 
 ### 其他示例
 
@@ -291,7 +353,7 @@ python bench_multi_turn.py \
 | `--model` | 模型名，留空自动探测 `/v1/models`（可从 .env 读取） |
 | `--api-key` | API Key，自动注入 `OPENAI_API_KEY` 环境变量（可从 .env 读取） |
 | `--tokenizer` | tokenizer 名/路径，留空则用 `--model`（可从 .env 读取） |
-| `--dataset-path` | ShareGPT V3 JSON 路径（可从 .env 读取） |
+| `--dataset-path` | 数据集 JSON 路径（ShareGPT V3，可从 .env 读取） |
 | `--num-sessions` | 会话数（每次发一个完整多轮对话） |
 | `--num-turns` | 每会话最大轮数上限；自然轮数不足此值的会话按实际轮数 |
 | `--min-turns` | 仅保留 user 轮数不少于该值的原始对话（变长轮次过滤门槛，默认 2） |
@@ -315,6 +377,7 @@ python bench_multi_turn.py \
 | `--output-file` | JSONL 文件名（仅文件名，自动放入子目录） |
 | `--report-md` | Markdown 报告文件名（仅文件名，自动放入子目录，默认 `report.md`） |
 | `--accept-steady-tpm` | 验收要求：稳态 TPM |
+| `--accept-peak-concurrency` | 信息项：1 亿 TPM 下的并发数展示（不判定） |
 | `--accept-request-rps` | 验收要求：稳态 RPS（默认 0.6） |
 | `--accept-success-rate` | 验收要求：成功率（默认 0.995） |
 | `--accept-ttft-p50-ms` | 验收要求：TTFT p50（默认 8000） |
@@ -331,10 +394,10 @@ python bench_multi_turn.py \
 
 | 章节 | 内容 |
 |---|---|
-| **测试结论汇总** | 客户 6 项指标（请求吞吐/TTFT P50/P95/TPOT P50/P95/缓存命中率）的要求/实际/结论表 + 总体结论（通过/不通过） |
-| **全程** | total_requests/transport_success/success/truncated/actual_tokens/TPM/cache_hit_rate 全局表 + 延迟分位表(avg/p50/p75/p90/p95/p99) |
+| **测试结论汇总** | 7 项判定指标（请求吞吐/TTFT P50/P95/TPOT P50/P95/缓存命中率/稳态TPM）的要求/实际/结论表 + 总体结论（通过/不通过）+ 1 项并发信息行（1 亿 TPM 下并发数，不判定）；服务端未开缓存报告时命中率显示 N/A（不参与判定） |
+| **全程** | total_requests/transport_success/success/truncated/actual_tokens/TPM/cache_hit_rate/peak_concurrency 全局表 + 延迟分位表(avg/p50/p75/p90/p95/p99) |
 | **连续稳态** | 是否获得稳态窗口 |
-| **验收明细** | 18 项验收项(实际/要求/结论/必过)，含 steady_tpm/success_rate/ttft_p50/ttft_p95/tpot_p50/tpot_p95/cache_hit/zero_429/usage_complete/length_profile |
+| **验收明细** | 15 个验收行(实际/要求/结论/必过)：steady_tpm、continuous_steady_window、request_throughput_rps、success_rate、error_rate、http_429_rate、ttft_ms_p50、ttft_ms_p95、tpot_ms_p50、tpot_ms_p95、steady_cache_hit_rate、peak_concurrency、zero_429、usage_complete、length_profile |
 | **全程分轮** | 每轮汇总表(请求数/req/s/input/output tok/s/cache hit) + 每轮延迟表(Round 0..N) |
 | **稳态分轮** | 同上，仅稳态会话 |
 | **stream / full_run** | 全程流式延迟表 |

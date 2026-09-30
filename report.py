@@ -145,6 +145,7 @@ def generate_markdown(
     target_rps: float,
     start_rps: float,
     output_lens: List[int],
+    peak_concurrency: int = 0,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     has_steady = steady_sessions > 0 and steady_dur > 0
@@ -298,10 +299,25 @@ def generate_markdown(
          f"{steady_cache_hit * 100:.2f}%" if steady_cache_hit is not None else "N/A",
          _cmp_ge(steady_cache_hit, args.accept_cache_hit_rate)),
     ]
+    # 新指标（客户目标：稳态 TPM 1亿）——TPM 达标即通过
+    if args.accept_steady_tpm is not None:
+        summary_rows.append(
+            ("稳态TPM (tokens/min)", f">= {args.accept_steady_tpm:,.0f}",
+             f"{actual_tpm_stable:,.0f}" if actual_tpm_stable is not None else "N/A",
+             _cmp_ge(actual_tpm_stable, args.accept_steady_tpm)))
+    # 峰值并发为信息项：显示 1 亿 TPM 下实际压到的并发数，不参与通过/不通过判定
+    info_rows = []
+    if args.accept_peak_concurrency is not None:
+        _peak_val = peak_concurrency if peak_concurrency and peak_concurrency > 0 else None
+        info_rows.append(
+            ("1亿 TPM 下并发数 (requests)", "信息项（不判定）",
+             f"{_peak_val:g}" if _peak_val is not None else "N/A"))
     lines.append("| 指标 | 要求 | 实际 | 结论 |")
     lines.append("| --- | --- | --- | --- |")
     for label, req, act, p in summary_rows:
         lines.append(f"| {label} | {req} | {act} | {_pf(p)} |")
+    for label, req, act in info_rows:
+        lines.append(f"| {label} | {req} | {act} | — |")
     overall = all(p is True for _, _, _, p in summary_rows)
     lines.append("")
     lines.append(f"**总体结论：{'通过' if overall else '不通过'}**")
@@ -328,6 +344,7 @@ def generate_markdown(
     lines.append(f"| actual_tpm_stable | {_fmt_num(actual_tpm_stable, ',.2f')} |")
     lines.append(f"| cache_hit_rate | {_fmt_num(cache_hit_rate, '.2f')} |")
     lines.append(f"| cache_observable_rate | {_fmt_num(cache_observable_rate, '.2f')} |")
+    lines.append(f"| peak_concurrency | {peak_concurrency:g} |")
     lines.append("")
 
     lines.append("| Metric (ms) | Samples | avg | p50 | p75 | p90 | p95 | p99 |")
@@ -389,8 +406,10 @@ def generate_markdown(
          lambda a, r: a is not None and a <= r, True),
         ("tpot_ms_p95", steady_tpot_p95, args.accept_tpot_p95_ms,
          lambda a, r: a is not None and a <= r, True),
-        ("steady_cache_hit_rate", steady_cache_hit, args.accept_cache_hit_rate,
-         lambda a, r: a is not None and a >= r, True),
+         ("steady_cache_hit_rate", steady_cache_hit, args.accept_cache_hit_rate,
+          lambda a, r: a is not None and a >= r, True),
+        ("peak_concurrency", peak_concurrency, None,
+         None, "信息项"),
         ("zero_429", cum_429 if has_steady else None, args.accept_zero_429,
          lambda a, r: a <= r, True),
         ("usage_complete", usage_complete, args.accept_usage_complete,
@@ -404,7 +423,7 @@ def generate_markdown(
             act_str = _fmt_num(actual, ".4f")
         else:
             act_str = str(actual)
-        req_str = str(required)
+        req_str = "—" if required is None else str(required)
         v = verdict(actual, required, cmp_fn)
         lines.append(f"| {name} | {act_str} | {req_str} | {v} | {must} |")
 

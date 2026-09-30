@@ -133,7 +133,9 @@ def build_parser(env: dict = None):
 
     accept = parser.add_argument_group("acceptance")
     accept.add_argument("--accept-steady-tpm", type=float, default=None,
-                       help="验收要求：稳态 TPM")
+                      help="验收要求：稳态 TPM")
+    accept.add_argument("--accept-peak-concurrency", type=int, default=None,
+                       help="信息项：报告展示该吞吐下实际压到的并发数（不参与通过/不通过判定）")
     accept.add_argument("--accept-request-rps", type=float, default=0.6,
                        help="验收要求：稳态 RPS")
     accept.add_argument("--accept-success-rate", type=float, default=0.995,

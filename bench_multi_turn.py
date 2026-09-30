@@ -56,11 +56,12 @@ def make_extra_request_body(args):
 def preflight_capacity(args, target_rps, loaded):
     if args.sustain_seconds is None:
         return
-    window = args.ramp_seconds + args.sustain_seconds
+    # 爬坡期速率从 0 线性升至目标，平均为一半；×1.2 覆盖泊松到达的随机波动
+    window = args.ramp_seconds / 2.0 + args.sustain_seconds
     needed = window * target_rps * 1.2
     if loaded < needed:
         print(
-            f"[warn] 数据集容量可能不足：爬坡+稳态窗口 {window:.0f}s @ {target_rps:.3f} rps "
+            f"[warn] 数据集容量可能不足：爬坡+稳态窗口 {window:.0f}s(等效满速) @ {target_rps:.3f} rps "
             f"约需 {needed:.0f} 会话，实际 {loaded}；测试可能在稳态结束前耗尽会话。"
             f"请增大 --num-sessions 或缩短窗口。",
             file=sys.stderr,
@@ -134,9 +135,21 @@ async def run_benchmark(args):
 
     sem = asyncio.Semaphore(args.max_concurrency if args.max_concurrency > 0 else 10 ** 9)
 
+    # 并发跟踪：信号量占用数 = 实际同时在执行的会话数（每个会话同一时刻只有 1 个在途
+    # HTTP 请求）。peak_concurrency 即真实峰值并发（服务端视角）。
+    current_concurrency = 0
+    peak_concurrency = 0
+
     async def limited(rfi, pbar):
+        nonlocal current_concurrency, peak_concurrency
         async with sem:
-            return await request_func(rfi, pbar=pbar)
+            current_concurrency += 1
+            if current_concurrency > peak_concurrency:
+                peak_concurrency = current_concurrency
+            try:
+                return await request_func(rfi, pbar=pbar)
+            finally:
+                current_concurrency -= 1
 
     extra_body = make_extra_request_body(args)
 
@@ -301,12 +314,14 @@ async def run_benchmark(args):
         metrics_full, metrics_steady, wall_dur, steady_dur,
         len(all_session_outputs), len(steady_session_outputs),
         ramp_session_count, args.num_turns, terminated, termination_reason, cum_429,
+        peak_concurrency, args.max_concurrency,
     )
     write_jsonl(
         args, metrics_full, metrics_steady, all_flat, steady_flat,
         output_lens_full, output_lens_steady, backend, model, target_rps,
         wall_dur, steady_dur, len(steady_session_outputs), ramp_session_count,
         terminated, termination_reason, monitor_history, cum_429,
+        peak_concurrency,
     )
     write_markdown_report(
         args, metrics_full, metrics_steady,
@@ -314,13 +329,15 @@ async def run_benchmark(args):
         wall_dur, steady_dur, len(steady_session_outputs), ramp_session_count,
         terminated, termination_reason, monitor_history, cum_429,
         backend, model, target_rps, start_rps, output_lens_full,
+        peak_concurrency,
     )
     return 0
 
 
 def print_console_summary(metrics_full, metrics_steady, wall_dur, steady_dur,
                           total_sessions, steady_sessions, ramp_sessions,
-                          num_turns, terminated, termination_reason, cum_429):
+                          num_turns, terminated, termination_reason, cum_429,
+                          peak_concurrency=0, max_concurrency=0):
     print("\n" + "=" * 70)
     print("Multi-turn long-context benchmark results")
     print("=" * 70)
@@ -328,6 +345,8 @@ def print_console_summary(metrics_full, metrics_steady, wall_dur, steady_dur,
           f"completed={metrics_full.completed}  rps={metrics_full.request_throughput:.4f}")
     print(f"         output_tps={metrics_full.output_throughput:.2f}  "
           f"total_tps={metrics_full.total_throughput:.2f}")
+    print(f"         peak_concurrency={peak_concurrency}"
+          + (f" (cap={max_concurrency})" if max_concurrency > 0 else " (uncapped)"))
     print(f"  [稳态] duration={steady_dur:.3f}s  sessions={steady_sessions}  "
           f"ramp_excluded={ramp_sessions}")
     print(f"         rps={metrics_steady.request_throughput:.4f}  "
@@ -347,7 +366,8 @@ def print_console_summary(metrics_full, metrics_steady, wall_dur, steady_dur,
 def write_jsonl(args, metrics_full, metrics_steady, all_flat, steady_flat,
                output_lens_full, output_lens_steady, backend, model, target_rps,
                wall_dur, steady_dur, steady_sessions, ramp_sessions,
-               terminated, termination_reason, monitor_history, cum_429):
+               terminated, termination_reason, monitor_history, cum_429,
+               peak_concurrency=0):
     start_rps, _ = compute_rps(args)
     result = {
         "tag": args.tag,
@@ -371,6 +391,7 @@ def write_jsonl(args, metrics_full, metrics_steady, all_flat, steady_flat,
         "terminated": terminated,
         "termination_reason": termination_reason,
         "cum_429": cum_429,
+        "peak_concurrency": peak_concurrency,
         "monitor_history": monitor_history,
         "full": {
             "completed": metrics_full.completed,
@@ -430,13 +451,15 @@ def write_markdown_report(args, metrics_full, metrics_steady,
                           all_session_outputs, steady_session_outputs,
                           wall_dur, steady_dur, steady_sessions, ramp_sessions,
                           terminated, termination_reason, monitor_history, cum_429,
-                          backend, model, target_rps, start_rps, output_lens):
+                          backend, model, target_rps, start_rps, output_lens,
+                          peak_concurrency=0):
     md = generate_markdown(
         args, metrics_full, metrics_steady,
         all_session_outputs, steady_session_outputs,
         wall_dur, steady_dur, steady_sessions, ramp_sessions,
         terminated, termination_reason, monitor_history, cum_429,
         backend, model, target_rps, start_rps, output_lens,
+        peak_concurrency,
     )
     base = args.report_md
     if not base:
