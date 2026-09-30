@@ -83,6 +83,8 @@ def build_parser(env: dict = None):
                          help="过滤首轮(system+user)加单轮输出超过该长度的会话")
     dataset.add_argument("--min-turns", type=int, default=2,
                          help="仅保留 user 轮数不少于该值的原始对话(变长轮次的过滤门槛)")
+    dataset.add_argument("--num-shared-prefixes", type=int, default=0,
+                       help="共享 system prompt 组数；0=每会话唯一前缀（cache hit≈0），>0=按 round-robin 分配共享前缀给会话，产生 60%-100% cache hit")
     dataset.add_argument("--tokenizer", type=str,
                          default=_env_default("TOKENIZER"),
                          help="tokenizer 名，留空则用 --model（可从 .env 读取）")
@@ -131,15 +133,19 @@ def build_parser(env: dict = None):
 
     accept = parser.add_argument_group("acceptance")
     accept.add_argument("--accept-steady-tpm", type=float, default=None,
-                         help="验收要求：稳态 TPM")
+                       help="验收要求：稳态 TPM")
     accept.add_argument("--accept-request-rps", type=float, default=0.6,
-                         help="验收要求：稳态 RPS")
+                       help="验收要求：稳态 RPS")
     accept.add_argument("--accept-success-rate", type=float, default=0.995,
-                         help="验收要求：成功率")
-    accept.add_argument("--accept-ttft-p50-ms", type=float, default=15000.0,
-                         help="验收要求：稳态 TTFT p50 (ms)")
-    accept.add_argument("--accept-tpot-p50-ms", type=float, default=35.0,
-                         help="验收要求：稳态 TPOT p50 (ms)")
+                       help="验收要求：成功率")
+    accept.add_argument("--accept-ttft-p50-ms", type=float, default=8000.0,
+                       help="验收要求：稳态 TTFT p50 (ms)")
+    accept.add_argument("--accept-ttft-p95-ms", type=float, default=30000.0,
+                       help="验收要求：稳态 TTFT p95 (ms)")
+    accept.add_argument("--accept-tpot-p50-ms", type=float, default=30.0,
+                       help="验收要求：稳态 TPOT p50 (ms)")
+    accept.add_argument("--accept-tpot-p95-ms", type=float, default=45.0,
+                       help="验收要求：稳态 TPOT p95 (ms)")
     accept.add_argument("--accept-cache-hit-rate", type=float, default=0.6,
                          help="验收要求：稳态 cache hit rate")
     accept.add_argument("--accept-zero-429", type=int, default=0,

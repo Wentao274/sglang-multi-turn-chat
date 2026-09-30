@@ -46,6 +46,7 @@ def load_sharegpt_multiturn(
     min_turns: int = 2,
     seed: int = 42,
     apply_chat_template: bool = False,
+    num_shared_prefixes: int = 0,
 ) -> List[DatasetRow]:
     random.seed(seed)
     np.random.seed(seed)
@@ -82,6 +83,13 @@ def load_sharegpt_multiturn(
         )
     random.shuffle(candidates)
 
+    shared_prompts = []
+    if system_prompt_len > 0 and num_shared_prefixes > 0:
+        shared_prompts = [gen_prompt(tokenizer, system_prompt_len)
+                         for _ in range(num_shared_prefixes)]
+        print(f"[sharegpt-multiturn] shared_prefixes={num_shared_prefixes} "
+              f"(~{num_sessions // max(num_shared_prefixes, 1)} sessions/prefix)")
+
     rows: List[DatasetRow] = []
     for user_msgs in candidates:
         if len(rows) >= num_sessions:
@@ -99,7 +107,10 @@ def load_sharegpt_multiturn(
             ]
 
         if system_prompt_len > 0:
-            sys_p = gen_prompt(tokenizer, system_prompt_len)
+            if shared_prompts:
+                sys_p = shared_prompts[len(rows) % len(shared_prompts)]
+            else:
+                sys_p = gen_prompt(tokenizer, system_prompt_len)
             rounds = [
                 [{"role": "system", "content": sys_p},
                  {"role": "user", "content": turns[0]}]
@@ -131,7 +142,8 @@ def load_sharegpt_multiturn(
     total_out = sum(r.output_len * len(r.prompt) for r in rows)
     print(
         f"[sharegpt-multiturn] loaded={len(rows)} max_turns={cap} min_turns={need} "
-        f"system_prompt_len={system_prompt_len} (per-session unique) "
+        f"system_prompt_len={system_prompt_len} "
+        f"({'shared_prefixes=' + str(num_shared_prefixes) if num_shared_prefixes > 0 else 'per-session unique'}) "
         f"unique_first_turns={available} "
         f"first-turn tokens sum={total_in} est output tokens={total_out}"
     )

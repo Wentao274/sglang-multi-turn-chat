@@ -1,0 +1,493 @@
+"""Smoke tests for the cached-token client fork and report integration.
+
+sglang cannot be imported locally (pybase64 fails), so we stub the
+sglang.benchmark.serving / sglang.benchmark.utils modules in sys.modules
+before importing our modules. Then:
+
+1. Spin up a local aiohttp server that mimics an sglang server with
+   --enable-cache-report (streams content chunks, then a final
+   usage-only chunk with choices: [], then [DONE]).
+2. Call the forked async_request_openai_chat_completions_cached and
+   verify: success, cached_tokens, prompt_tokens_actual.
+3. Run report._round_breakdown with mocked outputs to verify per-round
+   cache hit uses server values (and falls back to estimate when absent).
+
+Usage:  python test_cached_client.py
+"""
+
+import sys
+import types
+import asyncio
+import json
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# ============================================================
+# Stub sglang modules (mirrors the interface of sglang.benchmark.serving)
+# ============================================================
+
+
+@dataclass
+class RequestFuncInput:
+    prompt: str
+    api_url: str
+    prompt_len: int
+    output_len: int
+    model: str
+    lora_name: str = ""
+    image_data: Optional[List[str]] = None
+    extra_request_body: Optional[dict] = None
+    routing_key: Optional[str] = None
+    priority: int = 0
+    seed: Optional[int] = None
+    top_p: float = 1.0
+    top_k: int = -1
+    temperature: float = 1.0
+    repetition_penalty: float = 1.0
+    start_time: Optional[float] = None
+
+
+@dataclass
+class RequestFuncOutput:
+    generated_text: str = ""
+    success: bool = False
+    latency: float = 0.0
+    ttft: float = 0.0
+    itl: List[float] = field(default_factory=list)
+    prompt_len: int = 0
+    error: str = ""
+    output_len: int = 0
+    cached_tokens: int = 0
+    cached_tokens_details: Optional[dict] = None
+    prompt_tokens_actual: int = 0
+    start_time: float = 0.0
+
+    @classmethod
+    def init_new(cls, input):
+        return cls(
+            prompt_len=input.prompt_len,
+            output_len=input.output_len,
+        )
+
+
+@dataclass
+class BenchmarkMetrics:
+    completed: int = 0
+    request_throughput: float = 0.0
+    total_input: int = 0
+    total_input_text: int = 0
+    total_input_vision: int = 0
+    total_output: int = 0
+    total_output_retokenized: int = 0
+    mean_ttft_ms: float = 0.0
+    median_ttft_ms: float = 0.0
+    std_ttft_ms: float = 0.0
+    p90_ttft_ms: float = 0.0
+    p95_ttft_ms: float = 0.0
+    p99_ttft_ms: float = 0.0
+    mean_tpot_ms: float = 0.0
+    median_tpot_ms: float = 0.0
+    std_tpot_ms: float = 0.0
+    p90_tpot_ms: float = 0.0
+    p95_tpot_ms: float = 0.0
+    p99_tpot_ms: float = 0.0
+    mean_itl_ms: float = 0.0
+    median_itl_ms: float = 0.0
+    std_itl_ms: float = 0.0
+    p90_itl_ms: float = 0.0
+    p95_itl_ms: float = 0.0
+    p99_itl_ms: float = 0.0
+    mean_e2e_ms: float = 0.0
+    median_e2e_ms: float = 0.0
+    std_e2e_ms: float = 0.0
+    p90_e2e_ms: float = 0.0
+    p95_e2e_ms: float = 0.0
+    p99_e2e_ms: float = 0.0
+    concurrency: float = 0.0
+    max_concurrent_requests: int = 0
+
+
+_serving_ns = types.SimpleNamespace(
+    disable_stream=False,
+    disable_ignore_eos=False,
+    max_concurrency=10,
+    seed=42,
+    pbar=False,
+)
+
+
+def calculate_metrics(other, input_requests, dur_ts, tokenizer, specific_part=1.0):
+    if not input_requests:
+        return BenchmarkMetrics(), []
+    out_lens = []
+    for i in input_requests:
+        if not i.success:
+            continue
+        out_lens.append(i.output_len)
+    metrics = BenchmarkMetrics(
+        completed=len([r for r in input_requests if r.success]),
+        total_output=sum(out_lens),
+    )
+    return metrics, out_lens
+
+
+def wait_for_endpoint(endpoint_url, timeout=None, quiet=False):
+    return True
+
+
+def flush_server_cache(base_url, backend):
+    return True
+
+
+def wrap_multi_turn_request_func(request_func, backend):
+    async def _wrapped_multi_turn(input, pbar=None):
+        results = []
+        start_time = input.start_time
+        for i, prompt in enumerate(input.prompt):
+            inner_input = RequestFuncInput(
+                prompt=prompt,
+                api_url=input.api_url,
+                prompt_len=input.prompt_len,
+                output_len=input.output_len,
+                model=input.model,
+            )
+            output = await request_func(
+                request_func_input=inner_input,
+                pbar=pbar if i == len(input.prompt) - 1 else None,
+            )
+            output.start_time = start_time if start_time else 0.0
+            results.append(output)
+        return results
+
+    return _wrapped_multi_turn
+
+
+async def async_request_openai_chat_completions(request_func_input, pbar=None):
+    raise NotImplementedError("builtin client (not under test)")
+
+
+def _build_stub_package():
+    sglang_mod = types.ModuleType("sglang")
+    benchmark_mod = types.ModuleType("sglang.benchmark")
+    serving_mod = types.ModuleType("sglang.benchmark.serving")
+    utils_mod = types.ModuleType("sglang.benchmark.utils")
+    datasets_mod = types.ModuleType("sglang.benchmark.datasets")
+    datasets_common_mod = types.ModuleType("sglang.benchmark.datasets.common")
+
+    @dataclass
+    class DatasetRow:
+        prompt: str
+        prompt_len: int
+        output_len: int
+        image_data: Optional[List[str]] = None
+
+    datasets_common_mod.DatasetRow = DatasetRow
+    datasets_common_mod.SHAREGPT_FILENAME = "sharegpt_multiturn.json"
+    datasets_common_mod.SHAREGPT_REPO_ID = "Aeiftch/sharegpt_multiturn"
+    datasets_common_mod.gen_prompt = lambda system_prompt, n: f"{system_prompt} {n}"
+    utils_mod.download_and_cache_hf_file = lambda *a, **k: ""
+    utils_mod.is_file_valid_json = lambda p: True
+
+    serving_mod.RequestFuncInput = RequestFuncInput
+    serving_mod.RequestFuncOutput = RequestFuncOutput
+    serving_mod.BenchmarkMetrics = BenchmarkMetrics
+    serving_mod.MULTI_TURN_BACKENDS = ["openai", "openai_azure", "sglang"]
+    serving_mod.calculate_metrics = calculate_metrics
+    serving_mod.wait_for_endpoint = wait_for_endpoint
+    serving_mod.flush_server_cache = flush_server_cache
+    serving_mod.wrap_multi_turn_request_func = wrap_multi_turn_request_func
+    serving_mod.async_request_openai_chat_completions = async_request_openai_chat_completions
+    serving_mod.get_request_headers = lambda: {}
+    serving_mod.args = _serving_ns
+
+    def get_tokenizer(tokenizer_id, **kwargs):
+        class _DummyTokenizer:
+            name_or_path = "dummy"
+
+            def encode(self, *a, **k):
+                return []
+
+            def decode(self, *a, **k):
+                return ""
+
+            def apply_chat_template(self, *a, **k):
+                return "chat-template-applied"
+
+        return _DummyTokenizer()
+
+    utils_mod.get_tokenizer = get_tokenizer
+
+    sglang_mod.benchmark = benchmark_mod
+    benchmark_mod.serving = serving_mod
+    benchmark_mod.utils = utils_mod
+    benchmark_mod.datasets = datasets_mod
+    datasets_mod.common = datasets_common_mod
+    serving_mod.utils = utils_mod
+
+    sys.modules["sglang"] = sglang_mod
+    sys.modules["sglang.benchmark"] = benchmark_mod
+    sys.modules["sglang.benchmark.serving"] = serving_mod
+    sys.modules["sglang.benchmark.utils"] = utils_mod
+    sys.modules["sglang.benchmark.datasets"] = datasets_mod
+    sys.modules["sglang.benchmark.datasets.common"] = datasets_common_mod
+    return serving_mod
+
+
+_build_stub_package()
+
+# Stub transformers (not installed locally; only PreTrainedTokenizerBase type hint is used)
+_tf_mod = types.ModuleType("transformers")
+_tf_mod.PreTrainedTokenizerBase = object
+sys.modules.setdefault("transformers", _tf_mod)
+
+import request_client  # noqa: E402
+import report  # noqa: E402
+from request_client import async_request_openai_chat_completions_cached  # noqa: E402
+
+
+# ============================================================
+# Mock sglang server with --enable-cache-report
+# ============================================================
+
+SSE_CHUNKS = [
+    b'data: {"choices": [{"delta": {"role": "assistant"}}]}',
+    b'data: {"choices": [{"delta": {"content": "You"}}]}',
+    b'data: {"choices": [{"delta": {"content": " are"}}]}',
+    b'data: {"choices": [{"delta": {"content": " helpful"}}]}',
+    b'data: {"choices": [{"delta": {"content": "!"}}]}',
+    b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}',
+    b'data: {"choices": [], "usage": {"prompt_tokens": 1213, "completion_tokens": 4, '
+    b'"total_tokens": 1217, "prompt_tokens_details": {"cached_tokens": 1122, "audio_tokens": 0}}}',
+    b"data: [DONE]",
+]
+
+
+async def _handle_chat_completions(request):
+    from aiohttp import web
+
+    resp = web.StreamResponse(status=200)
+    resp.headers["Content-Type"] = "text/event-stream"
+    await resp.prepare(request)
+    for chunk in SSE_CHUNKS:
+        await resp.write(chunk + b"\n\n")
+        await asyncio.sleep(0.001)
+    return resp
+
+
+# ============================================================
+# Tests
+# ============================================================
+
+
+def test_fork_captures_cached_tokens():
+    """Fork must parse usage + prompt_tokens_details from the final SSE chunk."""
+
+    async def _run():
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", _handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18111)
+        await site.start()
+        try:
+            inner_input = RequestFuncInput(
+                prompt="hello world",
+                api_url="http://127.0.0.1:18111/v1/chat/completions",
+                prompt_len=11,
+                output_len=4,
+                model="test-model",
+            )
+            return await async_request_openai_chat_completions_cached(inner_input)
+        finally:
+            await runner.cleanup()
+
+    out = asyncio.run(_run())
+    assert out.success, f"request failed: {out.error}"
+    assert out.prompt_tokens_actual == 1213, out.prompt_tokens_actual
+    assert out.cached_tokens == 1122, out.cached_tokens
+    assert out.cached_tokens_details is not None
+    assert out.output_len == 4
+    assert out.generated_text == "You are helpful!"
+    print("PASS: fork captures cached_tokens=1122 / prompt_tokens_actual=1213")
+
+
+def test_round_breakdown_uses_server_values():
+    """_round_breakdown must use server-reported prompt tokens as denominator."""
+    # Two sessions, 2 rounds each.
+    # Session 0: round0 prompt=100 (server says 120), output 50; round1 prompt=100+50
+    s0r0 = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.05,
+                             latency=1.0, itl=[0.02, 0.03])
+    s0r0.prompt_tokens_actual = 120
+    s0r0.cached_tokens = 60
+    s0r0.cached_tokens_details = {"cached_tokens": 60}
+    s0r1 = RequestFuncOutput(success=True, prompt_len=100, output_len=40, ttft=0.06,
+                             latency=0.9, itl=[0.02, 0.03])
+    s0r1.prompt_tokens_actual = 200
+    s0r1.cached_tokens = 150
+    s0r1.cached_tokens_details = {"cached_tokens": 150}
+
+    # Session 1: no server values -> estimate fallback
+    s1r0 = RequestFuncOutput(success=True, prompt_len=90, output_len=45, ttft=0.07,
+                            latency=1.1, itl=[0.02, 0.03])
+    s1r1 = RequestFuncOutput(success=True, prompt_len=90, output_len=35, ttft=0.08,
+                            latency=0.8, itl=[0.02, 0.03])
+
+    sessions = [[s0r0, s0r1], [s1r0, s1r1]]
+    rows, _ = report._round_breakdown(sessions, duration=10.0, max_tokens_per_turn=50)
+
+    # Round 0: server 120 + estimate 90 = 210; cached = 60
+    r0 = rows[0]
+    assert r0[6] == 60 / 210, r0
+    # Round 1: server 200 + estimate (90+45=135) = 335; cached = 150
+    r1 = rows[1]
+    assert r1[6] == 150 / 335, r1
+    print(f"PASS: round0 hit={r0[6]:.4f} (60/210), round1 hit={r1[6]:.4f} (150/335)")
+
+
+def test_generate_markdown_cache_metrics():
+    """generate_markdown steady cache hit should use server-reported totals."""
+    s0r0 = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.05,
+                          latency=1.0, itl=[0.02, 0.03], start_time=100.0)
+    s0r0.prompt_tokens_actual = 120
+    s0r0.cached_tokens = 60
+    s0r0.cached_tokens_details = {"cached_tokens": 60}
+    s0r1 = RequestFuncOutput(success=True, prompt_len=100, output_len=40, ttft=0.06,
+                          latency=0.9, itl=[0.02, 0.03], start_time=101.0)
+    s0r1.prompt_tokens_actual = 200
+    s0r1.cached_tokens = 150
+    s0r1.cached_tokens_details = {"cached_tokens": 150}
+
+    sessions = [[s0r0, s0r1]]
+    steady_sessions = [[s0r0, s0r1]]
+
+    args = _mk_args()
+
+    metrics_full = BenchmarkMetrics(completed=2, request_throughput=0.2, total_output=90)
+    metrics_steady = BenchmarkMetrics(completed=2, request_throughput=0.2, total_output=90)
+
+    md = report.generate_markdown(
+        args, metrics_full, metrics_steady,
+        sessions, steady_sessions,
+        wall_dur=10.0, steady_dur=10.0,
+        steady_sessions=1, ramp_sessions=0,
+        terminated=False, termination_reason=None,
+        monitor_history=[], cum_429=0,
+        backend="sglang", model="test-model",
+        target_rps=0.2, start_rps=0.1, output_lens=[50, 40],
+    )
+    # steady input = 120 + 200 = 320 (server), cached = 210
+    assert "steady_cache_hit_rate" in md
+    # Find the cache hit value: 210/320 = 0.65625
+    assert "0.6563" in md or "0.656" in md, "steady cache hit 210/320 not found"
+    # Also check 测试结论汇总 exists
+    assert "测试结论汇总" in md
+    # full input uses server values too
+    assert "cache_hit_rate | 0.66" in md or "0.6563" in md
+    print("PASS: generate_markdown steady cache hit = 210/320 = 0.6563")
+
+
+def _mk_args():
+    """构建与 bench_multi_turn 一致的 args（供 generate_markdown 测试使用）。"""
+    import argparse
+    from config import build_parser, load_env, _preparse_env_file
+
+    parser = argparse.ArgumentParser()
+    env_file = _preparse_env_file()
+    env = load_env(env_file)
+    parser = build_parser(env)
+    return parser.parse_args([
+        "--base-url", "http://127.0.0.1:9999",
+        "--dataset-path", "nonexistent.json",
+        "--ramp-seconds", "10",
+        "--sustain-seconds", "10",
+    ])
+
+
+def test_round_breakdown_no_cache_flag():
+    """服务端未开 --enable-cache-report：无任何 cached_tokens_details。
+
+    期望：cache hit 显示 None（N/A），而非误导性的 0.00%。
+    """
+    s0 = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.05,
+                          latency=1.0, itl=[0.02, 0.03])
+    s0.cached_tokens = 0
+    s0.cached_tokens_details = None
+    sessions = [[s0]]
+    rows, _ = report._round_breakdown(sessions, duration=10.0, max_tokens_per_turn=50)
+    assert rows[0][6] is None, "cache hit should be None (N/A) when server flag off"
+    assert rows[0][7] == 0.0  # cache observable = 0
+    print("PASS: flag-off run shows cache hit = None (N/A)")
+
+
+def test_round_breakdown_cold_round_zero():
+    """运行可测（有 details）时，第 0 轮冷前缀 cache hit = 真实 0.00%。
+
+    场景：sglang cached=0 时省略 prompt_tokens_details
+    （服务端 usage_processor._details_if_cached 只在 count>0 时返回）。
+    """
+    # round 0: 冷前缀，无 details
+    r0 = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.05,
+                         latency=1.0, itl=[0.02, 0.03])
+    r0.cached_tokens = 0
+    r0.cached_tokens_details = None
+    # round 1: 命中 150/200
+    r1 = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.06,
+                         latency=0.9, itl=[0.02, 0.03])
+    r1.cached_tokens = 150
+    r1.cached_tokens_details = {"cached_tokens": 150}
+    r1.prompt_tokens_actual = 200
+    sessions = [[r0, r1]]
+    rows, _ = report._round_breakdown(sessions, duration=10.0, max_tokens_per_turn=50)
+    # round 0: hit = 0/(100+50) = 0.0（真实 0%，可测）
+    assert rows[0][6] == 0.0
+    # round 1: 服务端 prompt=200，cached=150
+    assert rows[1][6] == 150 / 200
+    print(f"PASS: cold round0 hit=0.00 (measurable), round1 hit={rows[1][6]:.4f}")
+
+
+def test_generate_markdown_flag_off_shows_na():
+    """服务端未开 --enable-cache-report。
+
+    全程表 cache_hit_rate 应显示 N/A（而非误导性 0.00）；
+    验收明细 steady_cache_hit_rate 实际值 None、结论 False（与客户模板一致）。
+    """
+    s = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.05,
+                         latency=1.0, itl=[0.02, 0.03], start_time=100.0)
+    s.cached_tokens = 0
+    s.cached_tokens_details = None
+    md = report.generate_markdown(
+        _mk_args(), BenchmarkMetrics(completed=1, total_output=50),
+        BenchmarkMetrics(completed=1, total_output=50),
+        [[s]], [[s]],
+        wall_dur=10.0, steady_dur=10.0, steady_sessions=1, ramp_sessions=0,
+        terminated=False, termination_reason=None,
+        monitor_history=[], cum_429=0,
+        backend="sglang", model="test-model",
+        target_rps=1.0, start_rps=0.1, output_lens=[50],
+    )
+    lines = md.split("\n")
+    # 全程表：cache_hit_rate | N/A
+    full_rows = [ln for ln in lines if ln.startswith("| cache_hit_rate")]
+    assert full_rows, "cache_hit_rate row not found"
+    assert any("N/A" in ln for ln in full_rows), f"expected N/A: {full_rows}"
+    # 全程表：cache_observable_rate | 0.00（诚实显示）
+    obs_rows = [ln for ln in lines if ln.startswith("| cache_observable_rate")]
+    assert obs_rows and "0.00" in obs_rows[0], f"observable should be 0.00: {obs_rows}"
+    # 验收明细：steady_cache_hit_rate 实际 None → 结论 False
+    acc_rows = [ln for ln in lines if ln.startswith("| steady_cache_hit_rate")]
+    assert acc_rows, "steady_cache_hit_rate acceptance row not found"
+    assert "| None |" in acc_rows[0] and "| False |" in acc_rows[0], f"got: {acc_rows[0]}"
+    print("PASS: flag-off generates N/A cache hit rate")
+
+
+if __name__ == "__main__":
+    test_fork_captures_cached_tokens()
+    test_round_breakdown_uses_server_values()
+    test_round_breakdown_no_cache_flag()
+    test_round_breakdown_cold_round_zero()
+    test_generate_markdown_cache_metrics()
+    test_generate_markdown_flag_off_shows_na()
+    print("\nAll smoke tests passed.")

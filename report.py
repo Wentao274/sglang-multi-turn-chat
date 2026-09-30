@@ -38,13 +38,24 @@ def _round_breakdown(session_outputs_list, duration, max_tokens_per_turn):
     session_outputs_list: List[List[RequestFuncOutput]] (per session, per round)
     Returns: (summary_rows, round_latency_tables)
 
-    Input tokens per round are estimated as:
-      prompt_len (round-0 context) + sum(output_len of all prior rounds)
-    This reflects the accumulated multi-turn context the server actually receives.
+    Input tokens per round:
+      - 优先取服务端 usage 报告的 prompt_tokens（真实输入，含模板/分词差异）
+      - 服务端未报告时回退估算: prompt_len (round-0 context) + sum(output_len of prior rounds)
+    Cache hit = cached_tokens / input tokens（cached_tokens 需服务端 --enable-cache-report）。
+
+    可测性判定（运行级）：任一请求返回过 prompt_tokens_details 即视为可测。
+    sglang 在 cached_tokens=0 时省略该字段（见服务端 usage_processor._details_if_cached），
+    因此第 0 轮（冷前缀）details 普遍缺失但命中率应记为真实的 0%，而非 N/A；
+    只有整个运行无任何 details（服务端未开 --enable-cache-report）才显示 N/A。
     """
     max_round = max(len(s) for s in session_outputs_list) if session_outputs_list else 0
     summary_rows = []
     round_latency = {}
+    cache_measurable = any(
+        getattr(o, "cached_tokens_details", None) is not None
+        for s in session_outputs_list for o in s
+        if o is not None and o.success
+    )
 
     for r in range(max_round):
         round_outs = [s[r] for s in session_outputs_list if r < len(s) and s[r] is not None]
@@ -61,15 +72,22 @@ def _round_breakdown(session_outputs_list, duration, max_tokens_per_turn):
         for s in session_outputs_list:
             if r >= len(s) or s[r] is None or not s[r].success:
                 continue
-            base_prompt = getattr(s[0], "prompt_len", 0) or 0
-            prior_outputs = sum(getattr(s[j], "output_len", 0) or 0 for j in range(r))
-            input_toks += base_prompt + prior_outputs
+            pta = getattr(s[r], "prompt_tokens_actual", 0) or 0
+            if pta > 0:
+                input_toks += pta
+            else:
+                base_prompt = getattr(s[0], "prompt_len", 0) or 0
+                prior_outputs = sum(getattr(s[j], "output_len", 0) or 0 for j in range(r))
+                input_toks += base_prompt + prior_outputs
 
         output_toks = sum(getattr(o, "output_len", 0) or 0 for o in ok_outs)
 
         cached_total = sum(getattr(o, "cached_tokens", 0) or 0 for o in ok_outs)
         prompt_total = input_toks
-        cache_hit = cached_total / prompt_total if prompt_total > 0 else None
+        cache_hit = (
+            cached_total / prompt_total
+            if cache_measurable and prompt_total > 0 else None
+        )
         cache_obs = sum(
             1 for o in ok_outs if getattr(o, "cached_tokens_details", None) is not None
         ) / ok_count if ok_count > 0 else None
@@ -151,17 +169,27 @@ def generate_markdown(
         for r_idx, o in enumerate(s):
             if o is None or not o.success:
                 continue
-            base_prompt = getattr(s[0], "prompt_len", 0) or 0
-            prior_outputs = sum(getattr(s[j], "output_len", 0) or 0 for j in range(r_idx))
-            total_input_tokens += base_prompt + prior_outputs
+            pta = getattr(o, "prompt_tokens_actual", 0) or 0
+            if pta > 0:
+                total_input_tokens += pta
+            else:
+                base_prompt = getattr(s[0], "prompt_len", 0) or 0
+                prior_outputs = sum(getattr(s[j], "output_len", 0) or 0 for j in range(r_idx))
+                total_input_tokens += base_prompt + prior_outputs
     actual_tokens_total = total_input_tokens + total_output_tokens
 
     cached_total = sum(getattr(o, "cached_tokens", 0) or 0 for o in ok_flat)
-    cache_hit_rate = cached_total / total_input_tokens if total_input_tokens > 0 else None
     cache_observable = sum(
         1 for o in ok_flat if getattr(o, "cached_tokens_details", None) is not None
     )
     cache_observable_rate = cache_observable / success_requests if success_requests > 0 else None
+    # 运行级可测性：任一请求返回过 prompt_tokens_details（--enable-cache-report 生效）。
+    # 不可测时 cache_hit_rate 显示 N/A，而非误导性的 0.00。
+    cache_measurable = cache_observable > 0
+    cache_hit_rate = (
+        cached_total / total_input_tokens
+        if cache_measurable and total_input_tokens > 0 else None
+    )
 
     steady_output_tokens = sum(getattr(o, "output_len", 0) or 0 for o in ok_steady)
     steady_input_tokens = 0
@@ -169,11 +197,18 @@ def generate_markdown(
         for r_idx, o in enumerate(s):
             if o is None or not o.success:
                 continue
-            base_prompt = getattr(s[0], "prompt_len", 0) or 0
-            prior_outputs = sum(getattr(s[j], "output_len", 0) or 0 for j in range(r_idx))
-            steady_input_tokens += base_prompt + prior_outputs
+            pta = getattr(o, "prompt_tokens_actual", 0) or 0
+            if pta > 0:
+                steady_input_tokens += pta
+            else:
+                base_prompt = getattr(s[0], "prompt_len", 0) or 0
+                prior_outputs = sum(getattr(s[j], "output_len", 0) or 0 for j in range(r_idx))
+                steady_input_tokens += base_prompt + prior_outputs
     steady_cached = sum(getattr(o, "cached_tokens", 0) or 0 for o in ok_steady)
-    steady_cache_hit = steady_cached / steady_input_tokens if steady_input_tokens > 0 else None
+    steady_cache_hit = (
+        steady_cached / steady_input_tokens
+        if cache_measurable and steady_input_tokens > 0 else None
+    )
 
     request_rps = success_requests / wall_dur if wall_dur > 0 else 0
     input_tps = total_input_tokens / wall_dur if wall_dur > 0 else 0
@@ -196,6 +231,24 @@ def generate_markdown(
     steady_tpots = [t for t in (_compute_tpot(o) for o in ok_steady) if t is not None]
     steady_itls = [x for o in ok_steady for x in (o.itl or []) if x > 0]
 
+    # 稳态验收指标（测试结论汇总与验收明细共用），转 ms
+    _steady_ttft_vals = steady_ttfts
+    _ttft_p50_raw = _pct(_steady_ttft_vals, 50)
+    steady_ttft_p50 = _ttft_p50_raw * 1000 if _ttft_p50_raw is not None else None
+    _ttft_p95_raw = _pct(_steady_ttft_vals, 95)
+    steady_ttft_p95 = _ttft_p95_raw * 1000 if _ttft_p95_raw is not None else None
+
+    _steady_tpot_vals = steady_tpots
+    _tpot_p50_raw = _pct(_steady_tpot_vals, 50)
+    steady_tpot_p50 = _tpot_p50_raw * 1000 if _tpot_p50_raw is not None else None
+    _tpot_p95_raw = _pct(_steady_tpot_vals, 95)
+    steady_tpot_p95 = _tpot_p95_raw * 1000 if _tpot_p95_raw is not None else None
+
+    steady_rps = metrics_steady.request_throughput if has_steady else None
+    steady_success_rate = (
+        len(ok_steady) / len(steady_flat) if steady_flat else None
+    )
+
     lines = []
     lines.append(f"# 多轮数据集 Benchmark")
     lines.append("")
@@ -210,6 +263,48 @@ def generate_markdown(
         "TTFT 为客户端首个内容/推理数据块到达时间，TPOT 为 usage 估算，"
         "SSE 数据块间隔不等于逐 token 时延。N/A 表示不可测或无样本。"
     )
+    lines.append("")
+
+    # ========== 0. 测试结论汇总 ==========
+    lines.append("## 测试结论汇总")
+    lines.append("")
+
+    def _cmp_ge(a, r):
+        return None if a is None else a >= r
+
+    def _cmp_le(a, r):
+        return None if a is None else a <= r
+
+    def _pf(p):
+        return "N/A" if p is None else ("通过" if p else "不通过")
+
+    summary_rows = [
+        ("请求吞吐 (req/s)", f">= {args.accept_request_rps:g}",
+         f"{steady_rps:.2f}" if steady_rps is not None else "N/A",
+         _cmp_ge(steady_rps, args.accept_request_rps)),
+        ("TTFT P50 (s)", f"<= {args.accept_ttft_p50_ms / 1000:g}",
+         f"{steady_ttft_p50 / 1000:.3f}" if steady_ttft_p50 is not None else "N/A",
+         _cmp_le(steady_ttft_p50, args.accept_ttft_p50_ms)),
+        ("TTFT P95 (s)", f"<= {args.accept_ttft_p95_ms / 1000:g}",
+         f"{steady_ttft_p95 / 1000:.3f}" if steady_ttft_p95 is not None else "N/A",
+         _cmp_le(steady_ttft_p95, args.accept_ttft_p95_ms)),
+        ("TPOT P50 (ms)", f"<= {args.accept_tpot_p50_ms:g}",
+         f"{steady_tpot_p50:.2f}" if steady_tpot_p50 is not None else "N/A",
+         _cmp_le(steady_tpot_p50, args.accept_tpot_p50_ms)),
+        ("TPOT P95 (ms)", f"<= {args.accept_tpot_p95_ms:g}",
+         f"{steady_tpot_p95:.2f}" if steady_tpot_p95 is not None else "N/A",
+         _cmp_le(steady_tpot_p95, args.accept_tpot_p95_ms)),
+        ("稳态缓存命中率", f">= {args.accept_cache_hit_rate * 100:g}%",
+         f"{steady_cache_hit * 100:.2f}%" if steady_cache_hit is not None else "N/A",
+         _cmp_ge(steady_cache_hit, args.accept_cache_hit_rate)),
+    ]
+    lines.append("| 指标 | 要求 | 实际 | 结论 |")
+    lines.append("| --- | --- | --- | --- |")
+    for label, req, act, p in summary_rows:
+        lines.append(f"| {label} | {req} | {act} | {_pf(p)} |")
+    overall = all(p is True for _, _, _, p in summary_rows)
+    lines.append("")
+    lines.append(f"**总体结论：{'通过' if overall else '不通过'}**")
     lines.append("")
 
     # ========== 1. 全程 ==========
@@ -270,17 +365,6 @@ def generate_markdown(
         return "True" if actual >= required else "False"
 
     steady_tpm = actual_tpm_stable
-    steady_rps = metrics_steady.request_throughput if has_steady else None
-    steady_success_rate = (
-        len(ok_steady) / len(steady_flat) if steady_flat else None
-    )
-    _steady_ttft_vals = [o.ttft for o in ok_steady if o.ttft > 0]
-    _ttft_p50_raw = _pct(_steady_ttft_vals, 50) if _steady_ttft_vals else None
-    steady_ttft_p50 = _ttft_p50_raw * 1000 if _ttft_p50_raw is not None else None
-
-    _steady_tpot_vals = [t for t in (_compute_tpot(o) for o in ok_steady) if t is not None]
-    _tpot_p50_raw = _pct(_steady_tpot_vals, 50) if _steady_tpot_vals else None
-    steady_tpot_p50 = _tpot_p50_raw * 1000 if _tpot_p50_raw is not None else None
 
     usage_complete = (
         (1 if all(o.output_len > 0 for o in ok_steady) else 0)
@@ -299,7 +383,11 @@ def generate_markdown(
         ("http_429_rate", cum_429 if has_steady else None, -1.0, lambda a, r: True, False),
         ("ttft_ms_p50", steady_ttft_p50, args.accept_ttft_p50_ms,
          lambda a, r: a is not None and a <= r, True),
+        ("ttft_ms_p95", steady_ttft_p95, args.accept_ttft_p95_ms,
+         lambda a, r: a is not None and a <= r, True),
         ("tpot_ms_p50", steady_tpot_p50, args.accept_tpot_p50_ms,
+         lambda a, r: a is not None and a <= r, True),
+        ("tpot_ms_p95", steady_tpot_p95, args.accept_tpot_p95_ms,
          lambda a, r: a is not None and a <= r, True),
         ("steady_cache_hit_rate", steady_cache_hit, args.accept_cache_hit_rate,
          lambda a, r: a is not None and a >= r, True),
@@ -347,7 +435,11 @@ def generate_markdown(
         "dataset_mode": "sharegpt-multiturn",
         "context_scale": 1.0,
         "context_budget_exhausted_sessions": 0,
-        "note": "ShareGPT multi-turn dataset with per-session unique system prompt",
+        "note": (
+            f"ShareGPT multi-turn dataset with "
+            f"{'shared=' + str(getattr(args, 'num_shared_prefixes', 0)) if getattr(args, 'num_shared_prefixes', 0) > 0 else 'per-session unique'} "
+            f"system prompts"
+        ),
     }
     lines.append(
         f"| length_profile | `{json.dumps(length_profile, ensure_ascii=False)}` "
@@ -463,7 +555,11 @@ def generate_markdown(
         "dataset_mode": "sharegpt-multiturn",
         "context_scale": 1.0,
         "context_budget_exhausted_sessions": 0,
-        "note": "ShareGPT multi-turn dataset with per-session unique system prompt",
+        "note": (
+            f"ShareGPT multi-turn dataset with "
+            f"{'shared=' + str(getattr(args, 'num_shared_prefixes', 0)) if getattr(args, 'num_shared_prefixes', 0) > 0 else 'per-session unique'} "
+            f"system prompts"
+        ),
     }
     lines.append("```json")
     lines.append(json.dumps(lp, ensure_ascii=False, indent=2))

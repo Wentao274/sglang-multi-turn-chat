@@ -13,7 +13,6 @@ from tqdm.asyncio import tqdm
 import sglang.benchmark.serving as serving
 from sglang.benchmark.serving import (
     RequestFuncInput,
-    async_request_openai_chat_completions,
     calculate_metrics,
     flush_server_cache,
     wait_for_endpoint,
@@ -22,6 +21,7 @@ from sglang.benchmark.serving import (
 from sglang.benchmark.utils import get_tokenizer
 
 from config import build_parser, compute_rps, load_env, make_serving_namespace, _preparse_env_file
+from request_client import async_request_openai_chat_completions_cached
 from monitor import DegradationMonitor
 from ramp_scheduler import get_ramp_request
 from report import generate_markdown
@@ -93,6 +93,7 @@ async def run_benchmark(args):
         min_turns=args.min_turns,
         seed=args.seed,
         apply_chat_template=args.apply_chat_template,
+        num_shared_prefixes=args.num_shared_prefixes,
     )
     if not input_requests:
         print("[error] no sessions loaded", file=sys.stderr)
@@ -128,7 +129,7 @@ async def run_benchmark(args):
     preflight_capacity(args, target_rps, len(input_requests))
 
     request_func = wrap_multi_turn_request_func(
-        async_request_openai_chat_completions, backend=backend
+        async_request_openai_chat_completions_cached, backend=backend
     )
 
     sem = asyncio.Semaphore(args.max_concurrency if args.max_concurrency > 0 else 10 ** 9)
@@ -411,6 +412,8 @@ def write_jsonl(args, metrics_full, metrics_steady, all_flat, steady_flat,
             "ttfts": [o.ttft for o in all_flat],
             "itls": [o.itl for o in all_flat],
             "errors": [o.error for o in all_flat],
+            "cached_tokens": [getattr(o, "cached_tokens", 0) or 0 for o in all_flat],
+            "prompt_tokens_actual": [getattr(o, "prompt_tokens_actual", 0) or 0 for o in all_flat],
         }
 
     out_file = args.output_file
