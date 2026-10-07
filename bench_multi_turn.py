@@ -230,6 +230,18 @@ async def run_benchmark(args):
 
     pbar = tqdm(total=len(input_requests), desc="sessions")
     tasks = []
+
+    async def terminate_listener():
+        # stop_event 触发后立即取消所有未完成任务。
+        # 调度循环只在循环体内检查 stop_event；监控若在调度结束后才触发
+        # （过载场景常态），旧逻辑无人取消任务，排空可拖数十小时。
+        await stop_event.wait()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+    listener_task = asyncio.create_task(terminate_listener())
+
     async for req in get_ramp_request(
         input_requests, start_rps, target_rps, args.ramp_seconds,
         args.sustain_seconds, seed=args.seed, stop_event=stop_event,
@@ -243,11 +255,15 @@ async def run_benchmark(args):
         )
         tasks.append(asyncio.create_task(_run_one(rfi, pbar)))
 
-    if stop_event.is_set():
+    # 排空在途会话，drain_timeout 后强制取消剩余任务，
+    # 防止服务器挂起/过载时测试无限等待
+    if tasks:
+        await asyncio.wait(tasks, timeout=args.drain_timeout)
         for t in tasks:
             if not t.done():
                 t.cancel()
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    listener_task.cancel()
     if watchdog_task:
         watchdog_task.cancel()
     pbar.close()

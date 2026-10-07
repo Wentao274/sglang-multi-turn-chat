@@ -87,8 +87,6 @@ class DegradationMonitor:
     def feed(self, output) -> None:
         if output is None:
             return
-        if output.start_time < self.ramp_end_time:
-            pass
         ok = bool(output.success)
         latency = getattr(output, "latency", 0.0)
         ttft = getattr(output, "ttft", 0.0)
@@ -107,15 +105,18 @@ class DegradationMonitor:
         if is_429:
             self._cum_429 += 1
 
-        rec = (output.start_time, latency, ttft, tpot, itl, output_len, prompt_len, ok, cached, is_429)
+        now = time.perf_counter()
+        # 窗口按完成时刻索引：过载时慢请求（TTFT 数百秒）完成时才进入窗口，
+        # 才能被衰减检测看见。若按开始时间索引，慢请求完成时已滑出窗口，
+        # 监控只能看到快请求，止损永远不触发。
+        rec = (now, latency, ttft, tpot, itl, output_len, prompt_len, ok, cached, is_429)
         self._samples.append(rec)
         self._ramp_samples.append(rec)
 
-        now = time.perf_counter()
         deg_cutoff = now - self.window
-        ramp_cutoff = now - 60.0
         while self._samples and self._samples[0][0] < deg_cutoff:
             self._samples.popleft()
+        ramp_cutoff = now - 60.0
         while self._ramp_samples and self._ramp_samples[0][0] < ramp_cutoff:
             self._ramp_samples.popleft()
 
@@ -171,7 +172,10 @@ class DegradationMonitor:
         e2es = [s[1] for s in ok_samples]
         out_lens = [s[5] for s in ok_samples]
         prompt_lens = [s[6] for s in ok_samples]
-        window_dur = max(samples[-1][0] - samples[0][0], 1e-9)
+        # 吞吐分母用墙钟窗口时长，而非样本时间戳跨度：
+        # 崩溃场景下大量失败瞬间完成、时间戳几乎相同，样本跨度≈0 会
+        # 除出 1e9 量级的垃圾吞吐值。
+        window_dur = min(self.window, max(now - self.bench_start, 1e-9))
         concurrency = float(np.sum([s[1] for s in samples]) / window_dur) if samples else 0.0
 
         ok_ramp = [s for s in ramp_samples if s[7]]
@@ -237,9 +241,9 @@ class DegradationMonitor:
         if steady_elapsed < self.baseline_warmup_seconds:
             return None
 
+        window_dur = min(self.window, max(now - self.bench_start, 1e-9))
         if self.baseline_throughput is None:
             ok_samples = [s for s in samples if s[7]]
-            window_dur = max(samples[-1][0] - samples[0][0], 1e-9)
             self.baseline_throughput = len(ok_samples) / window_dur
             self.baseline_locked_at = now
             return None
@@ -252,7 +256,6 @@ class DegradationMonitor:
                 self.stop_reason = f"TTFT p99 {p99:.0f}ms >= {self.max_ttft_p99_ms:.0f}ms"
                 return self.stop_reason
 
-        window_dur = max(samples[-1][0] - samples[0][0], 1e-9)
         throughput = len(ok_samples) / window_dur
         if self.baseline_throughput > 0 and throughput < self.throughput_drop_ratio * self.baseline_throughput:
             self.stop_reason = (

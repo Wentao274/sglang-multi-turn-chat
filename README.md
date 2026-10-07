@@ -222,6 +222,7 @@ python bench_multi_turn.py \
   --max-tokens-per-turn 256 \
   --start-tpm 0 --target-tpm 120000000 \
   --ramp-seconds 300 --sustain-seconds 600 \
+  --drain-timeout 600 \
   --max-concurrency 1000 \
   --cache-report \
   --max-error-rate 0.10 \
@@ -281,6 +282,7 @@ uv run python bench_multi_turn.py --num-sessions 50000 --num-turns 14 --min-turn
 | `--avg-tokens-per-request` | （未传，默认 0） | TPM→RPS 折算系数；0=自动从数据集按每会话总 token 数估算 |
 | `--ramp-seconds` | `300` | TPM 从 start 线性爬升到 target 的时长（秒） |
 | `--sustain-seconds` | `600` | 到达稳态后持续压测时长（秒）；爬坡+稳态共 900s |
+| `--drain-timeout` | `600` | 排空超时（秒）：调度结束后等待在途会话完成的上限，超时强制取消剩余任务，防止过载/服务器挂起场景无限排空 |
 
 **并发控制**
 

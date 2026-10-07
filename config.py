@@ -98,6 +98,8 @@ def build_parser(env: dict = None):
                       help="RPS 从 start 线性爬升到 target 的时长(秒)")
     ramp.add_argument("--sustain-seconds", type=float, default=None,
                       help="到达稳态后持续压测时长；留空表示发完全部会话为止")
+    ramp.add_argument("--drain-timeout", type=float, default=600.0,
+                      help="排空超时(秒)：调度结束后等待在途会话完成的时限，超时强制取消剩余任务，防止过载/挂起场景无限排空")
     ramp.add_argument("--start-tpm", type=float, default=0.0, help="爬坡起始 TPM(优先于 start-rps)")
     ramp.add_argument("--target-tpm", type=float, default=None,
                       help="稳态目标 TPM(优先于 target-rps)，按 avg-tokens-per-request 折算 RPS")
