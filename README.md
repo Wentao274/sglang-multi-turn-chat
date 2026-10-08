@@ -106,7 +106,7 @@ DATASET_PATH=/path/to/ShareGPT_V3_unfiltered_cleaned_split.json
 
 框架使用 `ShareGPT_V3_unfiltered_cleaned_split.json` 单一数据集。推荐在 `configs/.env` 中设置 `DATASET_PATH`，也可通过 `--dataset-path` 指定：
 
-**容量（min_turns=2、首轮去重后）：51,493 条可用会话**——满足推荐测试参数（`--num-sessions 50000` 可加载，900s 窗口实际消耗约 36,500 会话，余量充足）。
+**容量（min_turns=2、首轮去重后）：51,493 条可用会话**——满足推荐测试参数（`--num-sessions 50000` 可加载，1200s 窗口实际消耗约 43,350 会话，余量 ~15%）。
 
 > 数据文件**不需要**放入仓库路径，用绝对路径或相对路径指定即可。如果不传 `--dataset-path`，框架会尝试从 HuggingFace 自动下载（仅 ShareGPT，需网络连通）。
 
@@ -141,7 +141,7 @@ python build_multiturn_dataset.py --no-sharegpt --output converted_only.json
 | **纯 ShareGPT（当前使用）** | **51,493** |
 | 合并后（可选） | 54,756（ShareGPT 51,493 + 新增 3,263） |
 
-> **容量结论**：推荐测试参数（1.2 亿 TPM 加压、8192 system prompt、爬坡 300s + 稳态 600s）下 900s 窗口实际消耗约 **36,500 会话**（48.7 会话/s × 750s 等效满速窗口）——纯 ShareGPT（51,493）**完全满足**；`--num-sessions 50000` 可正常加载。当前测试仅使用 ShareGPT 单一数据集；`build_multiturn_dataset.py` 保留为可选工具，如需数据源多样性可随时生成合并数据集（生成后把 `DATASET_PATH` 指向 `merged_multiturn.json` 即可）。
+> **容量结论**：推荐测试参数（1.2 亿 TPM 加压、8192 system prompt、爬坡 600s + 稳态 600s）下 1200s 窗口实际消耗约 **43,350 会话**（48.17 会话/s × 900s 等效满速窗口）——纯 ShareGPT（51,493）**完全满足**；`--num-sessions 50000` 可正常加载。注意启动时容量预检按 ×1.2 保守系数会提示"约需 52,000 会话"并打印警告——实际消耗 43,350 对 50,000 池余量约 15%，属保守告警，可忽略。当前测试仅使用 ShareGPT 单一数据集；`build_multiturn_dataset.py` 保留为可选工具，如需数据源多样性可随时生成合并数据集（生成后把 `DATASET_PATH` 指向 `merged_multiturn.json` 即可）。
 
 **容量与防缓存保证**：加载时按首轮 user 文本做 md5 去重，确保会话内容不重复；`--system-prompt-len > 0` 时每个会话生成**独立随机** system prompt，不同连续会话内容不同，避免跨会话缓存一直命中；同一会话内多轮内容连续（每轮重发完整历史，prefix 与上一轮重合），命中缓存越高效率越高（测试指标）。若去重+过滤后可用会话数 < `--num-sessions`，直接报错并提示调整参数（不靠重复凑数）。`--sustain-seconds` 设定时，框架会预估所需会话数并在不足时给出警告。
 
@@ -185,7 +185,7 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 
 1. **加压**：`--start-tpm 0 --target-tpm 120000000`，TPM 从零匀速爬坡至 1.2 亿（`--ramp-seconds`），之后持续压测（`--sustain-seconds`）。加压目标高于 1 亿验收线是**有意为之**：RPS 调度按计划 token（256/轮）估算，而模型自然停止时实际输出可能低于 256/轮，实际 TPM 略低于计划值，若加压目标=验收线，服务端跟得上也会被客户端调度限在 1 亿以下（详见 TPM 校准提示）。
 2. **并发封顶**：`--max-concurrency 1200`。服务端跟不上时请求在客户端信号量排队，服务端最多同时收到 1200 个在途请求；报告展示 1 亿吞吐下实际压到的并发数（`peak_concurrency`，信息项）。
-3. **会话池**：1.2 亿 TPM 下会话消耗极快（~49 会话/s），需要 `--min-turns 2`（ShareGPT 去重后 51,493 条）+ `--num-sessions 50000` 的池子；配合 `--system-prompt-len 8192` 增大每会话 token 数（平均 ~41,101 tokens/会话）以降低会话消耗速率（~49 会话/s，50K 池可支撑完整 900s 窗口（消耗 ~36,500）。若启动时出现容量警告，按提示缩短 `--sustain-seconds` 或减小 `--target-tpm`。
+3. **会话池**：1.2 亿 TPM 下会话消耗极快（~48 会话/s），需要 `--min-turns 2`（ShareGPT 去重后 51,493 条）+ `--num-sessions 50000` 的池子；配合 `--system-prompt-len 8192` 增大每会话 token 数（平均 ~41,101 tokens/会话）以降低会话消耗速率（~48 会话/s，50K 池可支撑完整 1200s 窗口（消耗 ~43,350）。若启动时出现容量警告，按提示缩短 `--sustain-seconds` 或减小 `--target-tpm`。
 4. **稳态窗口**：仅统计爬坡结束后才发起首轮的会话；TPM 与延迟指标均取该窗口。
 5. **衰减保护**：监控滑动窗口错误率 / 吞吐跌落 / TTFT p99，超阈值自动终止（防止压垮服务端）。
 

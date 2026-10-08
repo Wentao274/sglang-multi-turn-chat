@@ -16,47 +16,8 @@ from sglang.benchmark.serving import (
     calculate_metrics,
     flush_server_cache,
     wait_for_endpoint,
+    wrap_multi_turn_request_func,
 )
-
-
-def wrap_multi_turn_request_func(request_func, backend):
-    """sglang 内置 wrap 的本地 fork：透传 extra_request_body 与 routing_key。
-
-    安装版 sglang 的 wrap_multi_turn_request_func 构造每轮 inner
-    RequestFuncInput 时只带 prompt/api_url/prompt_len/output_len/model，
-    extra_request_body（reasoning_effort 等）与 routing_key（X-SMG-Routing-Key
-    头，会话亲和路由的前提）被丢弃——导致：
-      1. 网关仍随机路由，round1+ 缓存命中 ≈ 1/N；
-      2. glm-5.3 始终满强度思考，输出频繁触顶。
-
-    注意：不触碰 start_time——不同版本 sglang 的 RequestFuncInput 字段
-    不同（服务器版无该字段，直接访问会 AttributeError，1008_4 全部请求
-    失败的根因）；且 request_client 已为每轮 output 设置真实请求时间戳，
-    稳态窗口过滤依赖它，wrapper 覆盖会破坏报告。
-    """
-    async def _wrapped_multi_turn(input, pbar=None):
-        results = []
-        extra_request_body = getattr(input, "extra_request_body", None)
-        routing_key = getattr(input, "routing_key", None)
-        for i, prompt in enumerate(input.prompt):
-            inner_input = RequestFuncInput(
-                prompt=prompt,
-                api_url=input.api_url,
-                prompt_len=input.prompt_len,
-                output_len=input.output_len,
-                model=input.model,
-                extra_request_body=extra_request_body,
-                routing_key=routing_key,
-            )
-            output = await request_func(
-                request_func_input=inner_input,
-                pbar=pbar if i == len(input.prompt) - 1 else None,
-            )
-            results.append(output)
-        return results
-
-    return _wrapped_multi_turn
-
 
 from sglang.benchmark.utils import get_tokenizer
 

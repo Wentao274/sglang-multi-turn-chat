@@ -14,6 +14,7 @@ prompt_tokens_details.cached_tokens；否则 cached_tokens 恒为 0（命中率�
 chunk 中返回（OpenAI 标准；vLLM 必需，sglang 亦支持）。
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -111,6 +112,13 @@ async def async_request_openai_chat_completions_cached(
     disable_ignore_eos = bool(getattr(sargs, "disable_ignore_eos", False))
 
     extra_request_body = request_func_input.extra_request_body or {}
+    # sglang 自带 wrap_multi_turn_request_func 构造 inner 请求时丢弃
+    # extra_request_body —— 从全局 args 兜底 reasoning_effort（全测试同值）。
+    if "reasoning_effort" not in extra_request_body:
+        _effort = getattr(sargs, "reasoning_effort", None) if sargs else None
+        if _effort:
+            extra_request_body = dict(extra_request_body)
+            extra_request_body["reasoning_effort"] = _effort
 
     async with _create_session() as session:
         payload = {
@@ -132,6 +140,18 @@ async def async_request_openai_chat_completions_cached(
 
         headers = _get_request_headers()
         routing_key = getattr(request_func_input, "routing_key", None)
+        if not routing_key:
+            # 自带 wrapper 同样丢弃 routing_key —— 从首条消息内容哈希推导
+            # 会话标识：同一会话各轮的第一条消息相同（数据集按首轮 md5 去重，
+            # 跨会话唯一；per-session system prompt 亦唯一），内容哈希即稳定
+            # 的会话 ID，网关亲和（X-SMG-Routing-Key）依然成立。
+            try:
+                routing_key = "bench-" + hashlib.md5(
+                    json.dumps(messages[0], sort_keys=True, ensure_ascii=False)
+                    .encode("utf-8")
+                ).hexdigest()
+            except Exception:
+                routing_key = None
         if routing_key:
             headers[_ROUTING_KEY_HEADER] = routing_key
 

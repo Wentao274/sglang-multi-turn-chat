@@ -202,4 +202,7 @@ def make_serving_namespace(args):
         top_logprobs_num=0,
         token_ids_logprob=None,
         logprob_start_len=0,
+        # sglang 自带 multi-turn wrapper 丢弃 extra_request_body 字段，
+        # request_client 从 serving.args 兜底读取 reasoning_effort
+        reasoning_effort=getattr(args, "reasoning_effort", None),
     )

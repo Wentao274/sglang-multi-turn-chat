@@ -21,7 +21,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # ============================================================
 # Stub sglang modules (mirrors the interface of sglang.benchmark.serving)
@@ -30,13 +30,13 @@ from typing import List, Optional
 
 @dataclass
 class RequestFuncInput:
-    prompt: str
+    prompt: Any
     api_url: str
     prompt_len: int
     output_len: int
     model: str
-    lora_name: str = ""
-    image_data: Optional[List[str]] = None
+    lora_name: str
+    image_data: Optional[List[str]]
     extra_request_body: Optional[dict] = None
     routing_key: Optional[str] = None
     priority: int = 0
@@ -141,23 +141,40 @@ def flush_server_cache(base_url, backend):
 
 
 def wrap_multi_turn_request_func(request_func, backend):
+    """镜像服务器安装版 sglang 的真实行为（1008_2 实测确认）：
+
+    - 逐轮累积对话历史（round1+ 请求携带前轮内容 → prefix cache 命中前提）
+    - 构造 inner RequestFuncInput 时传递安装版已知的必填字段
+      （lora_name/image_data——服务器旧版 sglang 必填，缺失即 TypeError，
+      1008_5 全部请求失败的根因）
+    - **丢弃** extra_request_body / routing_key（安装版不认识的自定义字段，
+      1008_2 中亲和与 reasoning_effort 未生效的根因）——由 request_client
+      的内容哈希/全局 args 兜底补偿
+    - 不访问 start_time（服务器版 RequestFuncInput 无该字段，
+      1008_4 全部请求失败的根因）
+    """
     async def _wrapped_multi_turn(input, pbar=None):
+        prev_messages = []
         results = []
-        start_time = input.start_time
         for i, prompt in enumerate(input.prompt):
+            prev_messages.append({"role": "user", "content": prompt})
             inner_input = RequestFuncInput(
-                prompt=prompt,
+                prompt=list(prev_messages),
                 api_url=input.api_url,
                 prompt_len=input.prompt_len,
                 output_len=input.output_len,
                 model=input.model,
+                lora_name=getattr(input, "lora_name", ""),
+                image_data=getattr(input, "image_data", None),
             )
             output = await request_func(
                 request_func_input=inner_input,
                 pbar=pbar if i == len(input.prompt) - 1 else None,
             )
-            output.start_time = start_time if start_time else 0.0
             results.append(output)
+            prev_messages.append(
+                {"role": "assistant", "content": output.generated_text}
+            )
         return results
 
     return _wrapped_multi_turn
@@ -278,6 +295,7 @@ SSE_CHUNKS_REASONING = [
 _ACTIVE_CHUNKS = SSE_CHUNKS
 _CAPTURED_PAYLOAD = {}
 _CAPTURED_HEADERS = {}
+_ROUTING_KEYS = []
 
 
 async def _handle_chat_completions(request):
@@ -290,6 +308,7 @@ async def _handle_chat_completions(request):
         pass
     for k, v in request.headers.items():
         _CAPTURED_HEADERS[k] = v
+    _ROUTING_KEYS.append(request.headers.get("X-SMG-Routing-Key"))
     resp = web.StreamResponse(status=200)
     resp.headers["Content-Type"] = "text/event-stream"
     await resp.prepare(request)
@@ -323,6 +342,8 @@ def test_fork_captures_cached_tokens():
                 prompt_len=11,
                 output_len=4,
                 model="test-model",
+            lora_name="",
+                image_data=None,
             )
             return await async_request_openai_chat_completions_cached(inner_input)
         finally:
@@ -566,6 +587,8 @@ def test_request_payload_uses_max_tokens():
                 prompt_len=11,
                 output_len=4,
                 model="test-model",
+            lora_name="",
+                image_data=None,
             )
             return await async_request_openai_chat_completions_cached(inner_input)
         finally:
@@ -630,6 +653,8 @@ def test_ttft_first_token_includes_reasoning():
                 prompt_len=11,
                 output_len=6,
                 model="test-model",
+            lora_name="",
+                image_data=None,
             )
             return await async_request_openai_chat_completions_cached(inner_input)
         finally:
@@ -673,6 +698,8 @@ def test_reasoning_effort_in_payload():
                 prompt_len=11,
                 output_len=4,
                 model="test-model",
+                lora_name="",
+                image_data=None,
                 extra_request_body={"reasoning_effort": "low"},
             )
             return await async_request_openai_chat_completions_cached(inner_input)
@@ -714,6 +741,8 @@ def test_routing_key_header_sent():
                 prompt_len=11,
                 output_len=4,
                 model="test-model",
+                lora_name="",
+                image_data=None,
                 routing_key="bench-session-0",
             )
             return await async_request_openai_chat_completions_cached(inner_input)
@@ -777,21 +806,29 @@ def test_report_does_not_leak_reasoning_effort():
 
 
 def test_wrapper_propagates_routing_and_effort():
-    """端到端：经过 bench_multi_turn.wrap_multi_turn_request_func 的请求
-    必须携带 X-SMG-Routing-Key 头与 reasoning_effort 字段。
+    """端到端：经过安装版 wrapper 的请求仍携带 X-SMG-Routing-Key 头与 reasoning_effort。
 
-    用 SimpleNamespace 模拟服务器版 sglang 的 RequestFuncInput——
-    服务器版（旧 sglang）没有 start_time 字段，wrapper 直接访问
-    input.start_time 会 AttributeError（1008_4 全部请求失败的根因）。
+    安装版 sglang wrapper 只透传它认识的字段，丢弃 extra_request_body /
+    routing_key（1008_2 报告确认：亲和与 reasoning_effort 均未生效），
+    request_client 兜底补偿：
+    - routing_key 从首条消息内容哈希推导——同一会话各轮首条消息相同 →
+      同一 key → 网关亲和路由依然成立
+    - reasoning_effort 从 serving.args 读取（全测试同值）
+
+    同时验证 wrapper 逐轮累积对话历史（round1+ 请求携带前轮内容 →
+    prefix cache 命中前提），且不触碰 start_time（1008_4 根因）与
+    lora_name/image_data（1008_5 根因，服务器版必填）。
     """
-    global _ACTIVE_CHUNKS, _CAPTURED_HEADERS, _CAPTURED_PAYLOAD
+    global _ACTIVE_CHUNKS, _CAPTURED_HEADERS, _CAPTURED_PAYLOAD, _ROUTING_KEYS
+    import bench_multi_turn
+
     _ACTIVE_CHUNKS = SSE_CHUNKS
     _CAPTURED_HEADERS = {}
     _CAPTURED_PAYLOAD = {}
+    _ROUTING_KEYS = []
 
     async def _run():
         from aiohttp import web
-        import bench_multi_turn
 
         app = web.Application()
         app.router.add_post("/v1/chat/completions", _handle_chat_completions)
@@ -803,37 +840,51 @@ def test_wrapper_propagates_routing_and_effort():
             wrapped = bench_multi_turn.wrap_multi_turn_request_func(
                 async_request_openai_chat_completions_cached, backend="sglang"
             )
-            # 模拟服务器版 sglang：无 start_time 字段
+            # 安装版 wrapper 未见过这些自定义字段 —— outer 有无均可
             outer_input = types.SimpleNamespace(
                 prompt=["turn 1", "turn 2"],
                 api_url="http://127.0.0.1:18116/v1/chat/completions",
                 prompt_len=11,
                 output_len=6,
                 model="test-model",
-                extra_request_body={"reasoning_effort": "low"},
-                routing_key="bench-session-0",
             )
             return await wrapped(outer_input, pbar=None)
         finally:
             await runner.cleanup()
 
+    # 安装版 wrapper 丢弃 extra_request_body → request_client 从 serving.args 兜底
+    _serving_ns.reasoning_effort = "low"
     try:
         outs = asyncio.run(_run())
         assert len(outs) == 2, f"expected 2 results, got {len(outs)}"
-        assert _CAPTURED_HEADERS.get("X-SMG-Routing-Key") == "bench-session-0", \
-            f"wrapper dropped routing_key: {_CAPTURED_HEADERS}"
         assert _CAPTURED_PAYLOAD.get("reasoning_effort") == "low", \
-            f"wrapper dropped reasoning_effort: {_CAPTURED_PAYLOAD}"
+            f"payload missing reasoning_effort: {_CAPTURED_PAYLOAD}"
+        # 内容哈希路由：两轮请求的 X-SMG-Routing-Key 相同（同一会话）
+        assert len(_ROUTING_KEYS) == 2, \
+            f"expected 2 captured routing keys, got {_ROUTING_KEYS}"
+        assert all(k and k.startswith("bench-") for k in _ROUTING_KEYS), \
+            f"content-hash routing key missing: {_ROUTING_KEYS}"
+        assert _ROUTING_KEYS[0] == _ROUTING_KEYS[1], \
+            f"routing key must be stable across rounds: {_ROUTING_KEYS}"
+        # 历史累积：最后一轮请求的 messages 含第一轮内容 + 助手回复
+        msgs = _CAPTURED_PAYLOAD.get("messages", [])
+        texts = [m.get("content") for m in msgs]
+        assert "turn 1" in texts, f"history not accumulated: {texts}"
+        assert "turn 2" in texts, f"latest turn missing: {texts}"
+        assert any(m.get("role") == "assistant" for m in msgs), \
+            f"assistant reply not in history: {msgs}"
         # 每轮 output 的 start_time 由 request_client 设置（真实请求时间），
         # wrapper 不得覆盖为 0（稳态窗口过滤依赖它）
         assert all(getattr(o, "start_time", None) for o in outs), \
             "wrapper must not zero out output.start_time"
-        print("PASS: wrapper propagates routing_key and reasoning_effort "
-              "(server-style input without start_time)")
+        print("PASS: wrapper path keeps affinity header, reasoning_effort, "
+              "and multi-turn history")
     finally:
+        _serving_ns.reasoning_effort = None
         _ACTIVE_CHUNKS = SSE_CHUNKS
         _CAPTURED_HEADERS = {}
         _CAPTURED_PAYLOAD = {}
+        _ROUTING_KEYS = []
 
 
 if __name__ == "__main__":
