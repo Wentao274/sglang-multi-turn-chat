@@ -80,6 +80,9 @@ async def async_request_openai_chat_completions_cached(
       1. payload 附带 stream_options.include_usage=true（确保流式最终 chunk 带 usage）
       2. 解析 usage.prompt_tokens -> output.prompt_tokens_actual
       3. 解析 usage.prompt_tokens_details.cached_tokens -> output.cached_tokens
+      4. 生成上限发送 max_tokens 字段（而非 max_completion_tokens）：后者为
+         OpenAI 新字段，旧版 sglang / 多数网关不识别——1007 事故中 256 上限
+         被无视，每轮实际输出 ~1.7K token，decode 预算超 6.8x。
     其余行为（TTFT/ITL/latency/output_len/错误处理）与内置版本一致。
     """
     api_url = request_func_input.api_url
@@ -109,7 +112,10 @@ async def async_request_openai_chat_completions_cached(
         payload = {
             "model": request_func_input.model,
             "messages": messages,
-            "max_completion_tokens": request_func_input.output_len,
+            # 用 max_tokens（OpenAI 旧标准字段，vLLM/sglang/网关均识别）而非
+            # max_completion_tokens：1007 事故中网关不识别该新字段，256 上限被
+            # 无视，实际每轮输出 ~1.7K token，decode 预算超 6.8x。
+            "max_tokens": request_func_input.output_len,
             "stream": not disable_stream,
         }
         if "temperature" not in extra_request_body:

@@ -262,10 +262,17 @@ SSE_CHUNKS = [
     b"data: [DONE]",
 ]
 
+_CAPTURED_PAYLOAD = {}
+
 
 async def _handle_chat_completions(request):
     from aiohttp import web
 
+    try:
+        _CAPTURED_PAYLOAD.clear()
+        _CAPTURED_PAYLOAD.update(await request.json())
+    except Exception:
+        pass
     resp = web.StreamResponse(status=200)
     resp.headers["Content-Type"] = "text/event-stream"
     await resp.prepare(request)
@@ -519,6 +526,66 @@ def test_generate_markdown_flag_off_shows_na():
     print("PASS: flag-off generates N/A cache hit rate")
 
 
+def test_request_payload_uses_max_tokens():
+    """1007 事故回归：请求体必须发送 max_tokens 字段（而非 max_completion_tokens）。
+
+    网关/旧版 sglang 不识别 OpenAI 新字段 max_completion_tokens，导致 256 上限
+    被无视——实际每轮输出 ~1.7K token，decode 预算超 6.8x，验收结果失真。
+    """
+
+    async def _run():
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", _handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18112)
+        await site.start()
+        try:
+            inner_input = RequestFuncInput(
+                prompt="hello world",
+                api_url="http://127.0.0.1:18112/v1/chat/completions",
+                prompt_len=11,
+                output_len=4,
+                model="test-model",
+            )
+            return await async_request_openai_chat_completions_cached(inner_input)
+        finally:
+            await runner.cleanup()
+
+    out = asyncio.run(_run())
+    assert out.success, f"request failed: {out.error}"
+    assert _CAPTURED_PAYLOAD.get("max_tokens") == 4, \
+        f"payload must use max_tokens: {_CAPTURED_PAYLOAD}"
+    assert "max_completion_tokens" not in _CAPTURED_PAYLOAD, \
+        f"payload must not use max_completion_tokens: {_CAPTURED_PAYLOAD}"
+    print(f"PASS: payload uses max_tokens=4 (fields: {sorted(_CAPTURED_PAYLOAD)})")
+
+
+def test_verify_output_cap():
+    """warmup 上限校验（1007 事故回归）：超 cap 返回告警，正常返回 None。"""
+    import bench_multi_turn
+
+    ok = RequestFuncOutput(success=True, prompt_len=100, output_len=256, ttft=0.05,
+                           latency=1.0, itl=[0.02])
+    bad = RequestFuncOutput(success=True, prompt_len=100, output_len=1745, ttft=0.05,
+                           latency=20.0, itl=[0.01])
+    # 正常：全部 <= cap（含小容差）
+    assert bench_multi_turn.verify_output_cap([ok], 256) is None
+    assert bench_multi_turn.verify_output_cap([], 256) is None
+    # 超标：告警含 cap 与倍数
+    msg = bench_multi_turn.verify_output_cap([ok, bad], 256)
+    assert msg and "cap=256" in msg and "6.8" in msg, msg
+    # 单对象（非 list）同样处理
+    assert bench_multi_turn.verify_output_cap(bad, 256) is not None
+    # 失败轮不计入
+    failed = RequestFuncOutput(success=False, prompt_len=100, output_len=999, ttft=0,
+                               latency=0)
+    assert bench_multi_turn.verify_output_cap([failed], 256) is None
+    print("PASS: verify_output_cap flags oversize outputs, silent when normal")
+
+
 if __name__ == "__main__":
     test_fork_captures_cached_tokens()
     test_round_breakdown_uses_server_values()
@@ -527,4 +594,6 @@ if __name__ == "__main__":
     test_generate_markdown_cache_metrics()
     test_generate_markdown_flag_off_shows_na()
     test_tpm_concurrency_judgments()
+    test_request_payload_uses_max_tokens()
+    test_verify_output_cap()
     print("\nAll smoke tests passed.")

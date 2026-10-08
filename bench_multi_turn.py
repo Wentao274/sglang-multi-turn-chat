@@ -53,6 +53,38 @@ def make_extra_request_body(args):
     return body
 
 
+def verify_output_cap(results, cap, tolerance=8):
+    """校验 warmup 结果是否遵守 max_tokens 上限（1007 事故回归）。
+
+    事故：网关忽略生成上限字段，每轮实际输出 ~1.7K token（计划 256），
+    decode 预算超 6.8x，TPM/TPOT/轮周期全部失真。超限时立即告警，
+    避免烧完整场才发现数据不可用。
+
+    返回告警文案（str）；正常时返回 None。
+    """
+    if cap <= 0:
+        return None
+    if not isinstance(results, list):
+        results = [results]
+    oversize = []
+    for o in results:
+        if o is None or not getattr(o, "success", False):
+            continue
+        ol = getattr(o, "output_len", 0) or 0
+        if ol > cap + tolerance:
+            oversize.append(ol)
+    if not oversize:
+        return None
+    worst = max(oversize)
+    return (
+        f"服务器疑似未遵守 max_tokens 上限：cap={cap}，warmup 超标轮输出 "
+        f"{oversize}（最坏 {worst}，为上限的 {worst / cap:.1f} 倍）。"
+        "输出长度失控会使 decode 预算/轮周期/TPM 全部失真，验收结果不可用。"
+        f"请先单发一条 max_tokens={cap} 的请求，检查 usage.completion_tokens "
+        "是否 ≤ 上限，并排查网关是否透传该字段。"
+    )
+
+
 def preflight_capacity(args, target_rps, loaded):
     if args.sustain_seconds is None:
         return
@@ -162,9 +194,13 @@ async def run_benchmark(args):
         )
         print("[warmup] one multi-turn session ...")
         try:
-            await request_func(warm_input, pbar=None)
+            warm_result = await request_func(warm_input, pbar=None)
         except Exception as e:
             print(f"[warn] warmup failed: {e}", file=sys.stderr)
+        else:
+            cap_warning = verify_output_cap(warm_result, args.max_tokens_per_turn)
+            if cap_warning:
+                print(f"[warn] {cap_warning}", file=sys.stderr)
         if not args.no_flush_cache:
             try:
                 flush_server_cache(base_url, backend)

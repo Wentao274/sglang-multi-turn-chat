@@ -158,6 +158,9 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 1. 请求 payload 附带 `stream_options: {"include_usage": true}`，确保流式响应最终 chunk 携带 usage（OpenAI 标准；vLLM 必需，sglang 支持）。
 2. 解析 `usage.prompt_tokens` → `output.prompt_tokens_actual`（服务端真实输入 token 数）。
 3. 解析 `usage.prompt_tokens_details.cached_tokens` → `output.cached_tokens`（prefix cache 命中 token 数）。
+4. 生成上限发送 **`max_tokens` 字段**（OpenAI 旧标准，vLLM/sglang/网关均识别），而非 `max_completion_tokens`（OpenAI 新字段，部分网关/旧版服务端不识别）——1007 事故：网关忽略该新字段，256 上限失效，实际每轮输出 ~1.7K token（计划的 6.8 倍），decode 预算/TPM/TPOT 全部失真。
+
+**max_tokens 生效自检**：warmup 会话完成后自动校验各轮输出是否 ≤ `--max-tokens-per-turn` 上限（容差 +8 token）；超限立即打印 `[warn]`——说明服务端没有透传/遵守 max_tokens，验收数据不可用，应先修复网关再测。
 
 报告使用优先级：**服务端报告的真实值 > 客户端估算值**。未开启 `--enable-cache-report` 时回退到估算值（prompt_len + Σ prior output_len）。
 
@@ -178,7 +181,7 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 
 ### 测试逻辑
 
-1. **加压**：`--start-tpm 0 --target-tpm 120000000`，TPM 从零匀速爬坡至 1.2 亿（`--ramp-seconds`），之后持续压测（`--sustain-seconds`）。加压目标高于 1 亿验收线是**有意为之**：RPS 调度按计划 token（256/轮）估算，而模型自然停止实际输出 ≈170/轮，实际 TPM 低于计划值，若加压目标=验收线，服务端跟得上也会被客户端调度限在 1 亿以下（详见 TPM 校准提示）。
+1. **加压**：`--start-tpm 0 --target-tpm 120000000`，TPM 从零匀速爬坡至 1.2 亿（`--ramp-seconds`），之后持续压测（`--sustain-seconds`）。加压目标高于 1 亿验收线是**有意为之**：RPS 调度按计划 token（256/轮）估算，而模型自然停止时实际输出可能低于 256/轮，实际 TPM 略低于计划值，若加压目标=验收线，服务端跟得上也会被客户端调度限在 1 亿以下（详见 TPM 校准提示）。
 2. **并发封顶**：`--max-concurrency 1000`。服务端跟不上时请求在客户端信号量排队，服务端最多同时收到 1000 个在途请求；报告展示 1 亿吞吐下实际压到的并发数（`peak_concurrency`，信息项）。
 3. **会话池**：1.2 亿 TPM 下会话消耗极快（~49 会话/s），需要 `--min-turns 2`（ShareGPT 去重后 51,493 条）+ `--num-sessions 50000` 的池子；配合 `--system-prompt-len 8192` 增大每会话 token 数（平均 ~41,101 tokens/会话）以降低会话消耗速率（~49 会话/s，50K 池可支撑完整 900s 窗口（消耗 ~36,500）。若启动时出现容量警告，按提示缩短 `--sustain-seconds` 或减小 `--target-tpm`。
 4. **稳态窗口**：仅统计爬坡结束后才发起首轮的会话；TPM 与延迟指标均取该窗口。
@@ -202,7 +205,8 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 
 ### TPM 校准提示
 
-- `--target-tpm` 是加压目标（计划发送速率）；`actual_tpm_stable` 是服务端实际处理速率（验收依据）。默认（无 `--ignore-eos`）模型自然停止，实际输出 ≈170 tokens/轮（低于计划的 256），**实际 TPM < 计划 TPM**：8192 system prompt 占大头的推荐配置下 ≈ 计划的 ~99%，输出占比更高的场景可低至 ~85%。
+- `--target-tpm` 是加压目标（计划发送速率）；`actual_tpm_stable` 是服务端实际处理速率（验收依据）。默认（无 `--ignore-eos`）模型自然停止，实际输出 = min(自然长度, 256)，实际 TPM 略低于计划：8192 system prompt 占大头的推荐配置下 ≈ 计划的 ~99%，输出占比更高的场景可低至 ~85%。
+- **1007 事故教训**：客户端曾发送 `max_completion_tokens`（OpenAI 新字段），网关不识别也不报错——256 上限被静默忽略，实际每轮输出 ~1.7K token（6.8 倍），decode 预算/TPM/TPOT 全部失真。现改发 `max_tokens`（旧标准），warmup 后自动校验是否生效（超限打印 `[warn]`）。若仍告警，先单发一条 `max_tokens=256` 的请求检查 `usage.completion_tokens` 是否 ≤ 256，并排查网关字段透传。
 - 因此推荐 `--target-tpm 120000000`（加压目标）+ `--accept-steady-tpm 100000000`（验收线）：无论校准比例是 85% 还是 99%，实际稳态 TPM 都能越过 1 亿验收线（85% → 1.02 亿，99% → 1.19 亿）；若服务端容量不足，实际 TPM 体现真实瓶颈，仍按验收线判定。
 - 测试为一次性判定（不重测）：不通过即出最终结论。
 - `--max-concurrency`（推荐 1000）仍生效：限制同时在途的请求数，报告展示 1 亿吞吐下实际压到的并发数（`peak_concurrency`）作为参考。
@@ -249,7 +253,7 @@ python bench_multi_turn.py \
 
 > **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。`--avg-tokens-per-request` 默认 0=自动估算（从数据集每会话的轮数和 token 长度推算），无需手动设置。推荐配置 `--target-tpm 120000000 --accept-steady-tpm 100000000`——加压目标比 1 亿验收线高 20%，覆盖输出自然停止造成的实际<计划偏差（见下）。
 >
-> **TPM 校准提示**：默认（无 `--ignore-eos`）模型自然停止，实际输出 ≈170 tokens/轮（低于计划的 256），RPS 调度按计划 token 估算，因此**实际 TPM < 计划 TPM**（~85%-99%，取决于输入/输出构成）。加压目标 1.2 亿保证实际稳态 TPM ≥ 1 亿验收线。测试为一次性判定（不重测），实际压到的负载以报告 `actual_tpm_stable` 为准。
+> **TPM 校准提示**：默认（无 `--ignore-eos`）模型自然停止，实际输出 = min(自然长度, 256)，RPS 调度按计划 token 估算，因此**实际 TPM 略低于计划 TPM**（推荐配置下 ~99%）。加压目标 1.2 亿保证实际稳态 TPM ≥ 1 亿验收线。测试为一次性判定（不重测），实际压到的负载以报告 `actual_tpm_stable` 为准。
 
 ```bash
 # 方式二：不激活虚拟环境，用 uv run（自动使用 .venv）
@@ -269,7 +273,7 @@ uv run python bench_multi_turn.py --num-sessions 50000 --num-turns 14 --min-turn
 | `--num-sessions` | `50000` | 加载的会话（对话）总数；去重后不足会直接报错并提示调整参数 |
 | `--num-turns` | `14` | 每会话最大对话轮数上限；自然轮数不足此值的会话按实际轮数执行 |
 | `--min-turns` | `2` | 仅保留 user 轮数 ≥ 该值的原始对话（过滤门槛）；ShareGPT 去重后 51,493 条满足 ≥2 轮 |
-| `--max-tokens-per-turn` | `256` | 每次 API 请求的 max_tokens 上限 |
+| `--max-tokens-per-turn` | `256` | 每次 API 请求的 max_tokens 上限（payload 发送 `max_tokens` 字段；warmup 后自动校验生效性，超限告警） |
 | `--system-prompt-len` | `8192` | 每会话生成独立随机 system prompt 的 token 长度（防缓存命中 + 首轮即长上下文）；同时增大每会话 token 数，降低会话消耗速率 |
 | `--num-shared-prefixes` | （未传，默认 0） | 共享 system prompt 组数；默认 0=每会话唯一前缀（不同连续会话内容不同，符合客户要求）；>0=按 round-robin 分配共享前缀（跨会话也命中，非推荐模式） |
 
