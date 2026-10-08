@@ -746,6 +746,89 @@ def test_make_extra_request_body_reasoning():
     print("PASS: make_extra_request_body forwards reasoning_effort when set")
 
 
+def test_report_does_not_leak_reasoning_effort():
+    """报告与 JSONL 不得出现 reasoning_effort / reasoning-effort。
+
+    generate_markdown 只使用 args.max_tokens_per_turn 与 args.accept_*，
+    不转储 extra_request_body / argv / config；bench_multi_turn.py 的 JSONL
+    result 同样只有数据集/调度/指标字段。
+    """
+    s = RequestFuncOutput(success=True, prompt_len=100, output_len=50, ttft=0.05,
+                          latency=1.0, itl=[0.02, 0.03], start_time=100.0)
+    s.prompt_tokens_actual = 120
+    s.cached_tokens = 60
+    s.cached_tokens_details = {"cached_tokens": 60}
+
+    md = report.generate_markdown(
+        _mk_args("--reasoning-effort", "low"),
+        BenchmarkMetrics(completed=1, total_output=50),
+        BenchmarkMetrics(completed=1, total_output=50),
+        [[s]], [[s]],
+        wall_dur=10.0, steady_dur=10.0, steady_sessions=1, ramp_sessions=0,
+        terminated=False, termination_reason=None,
+        monitor_history=[], cum_429=0,
+        backend="sglang", model="test-model",
+        target_rps=1.0, start_rps=0.1, output_lens=[50],
+    )
+    assert "reasoning_effort" not in md, "report must not mention reasoning_effort"
+    assert "reasoning-effort" not in md, "report must not mention reasoning-effort"
+    assert "effort" not in md, "report must not mention effort at all"
+    print("PASS: report contains no reasoning-effort information")
+
+
+def test_wrapper_propagates_routing_and_effort():
+    """端到端：经过 bench_multi_turn.wrap_multi_turn_request_func 的请求
+    必须携带 X-SMG-Routing-Key 头与 reasoning_effort 字段。
+
+    之前缺一个走 wrapper 的测试，routing_key / extra_request_body 被内置
+    wrap_multi_turn_request_func 丢弃也发现不了。
+    """
+    global _ACTIVE_CHUNKS, _CAPTURED_HEADERS, _CAPTURED_PAYLOAD
+    _ACTIVE_CHUNKS = SSE_CHUNKS
+    _CAPTURED_HEADERS = {}
+    _CAPTURED_PAYLOAD = {}
+
+    async def _run():
+        from aiohttp import web
+        import bench_multi_turn
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", _handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18116)
+        await site.start()
+        try:
+            wrapped = bench_multi_turn.wrap_multi_turn_request_func(
+                async_request_openai_chat_completions_cached, backend="sglang"
+            )
+            outer_input = RequestFuncInput(
+                prompt=["turn 1", "turn 2"],
+                api_url="http://127.0.0.1:18116/v1/chat/completions",
+                prompt_len=11,
+                output_len=6,
+                model="test-model",
+                extra_request_body={"reasoning_effort": "low"},
+                routing_key="bench-session-0",
+            )
+            return await wrapped(outer_input, pbar=None)
+        finally:
+            await runner.cleanup()
+
+    try:
+        outs = asyncio.run(_run())
+        assert len(outs) == 2, f"expected 2 results, got {len(outs)}"
+        assert _CAPTURED_HEADERS.get("X-SMG-Routing-Key") == "bench-session-0", \
+            f"wrapper dropped routing_key: {_CAPTURED_HEADERS}"
+        assert _CAPTURED_PAYLOAD.get("reasoning_effort") == "low", \
+            f"wrapper dropped reasoning_effort: {_CAPTURED_PAYLOAD}"
+        print("PASS: wrapper propagates routing_key and reasoning_effort")
+    finally:
+        _ACTIVE_CHUNKS = SSE_CHUNKS
+        _CAPTURED_HEADERS = {}
+        _CAPTURED_PAYLOAD = {}
+
+
 if __name__ == "__main__":
     test_fork_captures_cached_tokens()
     test_round_breakdown_uses_server_values()
@@ -760,4 +843,6 @@ if __name__ == "__main__":
     test_reasoning_effort_in_payload()
     test_routing_key_header_sent()
     test_make_extra_request_body_reasoning()
+    test_report_does_not_leak_reasoning_effort()
+    test_wrapper_propagates_routing_and_effort()
     print("\nAll smoke tests passed.")
