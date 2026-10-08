@@ -111,6 +111,13 @@ def build_parser(env: dict = None):
                      help="忽略 EOS，强制每轮生成满 max-tokens(纯吞吐场景)；默认尊重 EOS 模拟真实对话")
     gen.add_argument("--temperature", type=float, default=0.0)
     gen.add_argument("--top-p", type=float, default=1.0)
+    gen.add_argument("--reasoning-effort", type=str, default=None,
+                     help="推理强度(low/medium/high)，设置后 payload 附带 reasoning_effort 字段；"
+                          "glm-5.3 不支持关闭思考，用 low 缩短思考段，降低 TTFT/TPOT 并提高有效输出占比")
+    gen.add_argument("--no-session-affinity", action="store_true",
+                     help="关闭会话亲和路由：默认每会话生成 routing_key 经 X-SMG-Routing-Key 头"
+                          "发给网关，使同一会话各轮落在同一后端节点（prefix cache 命中的前提）；"
+                          "多节点无亲和时 round1+ 命中率被随机路由稀释至 ~1/N")
     gen.add_argument("--no-stream", action="store_true", help="关闭流式")
     gen.add_argument("--no-warmup", action="store_true", help="跳过预热")
     gen.add_argument("--no-flush-cache", action="store_true", help="预热后不刷 prefix cache")

@@ -262,7 +262,22 @@ SSE_CHUNKS = [
     b"data: [DONE]",
 ]
 
+# 推理模型（glm-5.3 等）：先流式输出 reasoning_content（思考段），再输出 content。
+SSE_CHUNKS_REASONING = [
+    b'data: {"choices": [{"delta": {"role": "assistant"}}]}',
+    b'data: {"choices": [{"delta": {"reasoning_content": "Thinking hard"}}]}',
+    b'data: {"choices": [{"delta": {"reasoning_content": " about it"}}]}',
+    b'data: {"choices": [{"delta": {"content": "The answer"}}]}',
+    b'data: {"choices": [{"delta": {"content": " is 42."}}]}',
+    b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}',
+    b'data: {"choices": [], "usage": {"prompt_tokens": 1213, "completion_tokens": 6, '
+    b'"total_tokens": 1219, "prompt_tokens_details": {"cached_tokens": 1122, "audio_tokens": 0}}}',
+    b"data: [DONE]",
+]
+
+_ACTIVE_CHUNKS = SSE_CHUNKS
 _CAPTURED_PAYLOAD = {}
+_CAPTURED_HEADERS = {}
 
 
 async def _handle_chat_completions(request):
@@ -273,10 +288,12 @@ async def _handle_chat_completions(request):
         _CAPTURED_PAYLOAD.update(await request.json())
     except Exception:
         pass
+    for k, v in request.headers.items():
+        _CAPTURED_HEADERS[k] = v
     resp = web.StreamResponse(status=200)
     resp.headers["Content-Type"] = "text/event-stream"
     await resp.prepare(request)
-    for chunk in SSE_CHUNKS:
+    for chunk in _ACTIVE_CHUNKS:
         await resp.write(chunk + b"\n\n")
         await asyncio.sleep(0.001)
     return resp
@@ -586,6 +603,149 @@ def test_verify_output_cap():
     print("PASS: verify_output_cap flags oversize outputs, silent when normal")
 
 
+def test_ttft_first_token_includes_reasoning():
+    """1010 报告回归：TTFT 必须记在首个任意类型 token（含 reasoning_content）。
+
+    推理模型先流式输出思考段再输出正文；若只认 content，纯思考请求
+    ttft=0，TPOT=E2E/(n-1) 会把排队+prefill+思考全部摊入（52.8ms，
+    真实 decode ≈9.5ms）。思考文本也不得混入 generated_text
+    （下一轮上下文只回放正文）。
+    """
+    global _ACTIVE_CHUNKS
+    _ACTIVE_CHUNKS = SSE_CHUNKS_REASONING
+
+    async def _run():
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", _handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18113)
+        await site.start()
+        try:
+            inner_input = RequestFuncInput(
+                prompt="hello world",
+                api_url="http://127.0.0.1:18113/v1/chat/completions",
+                prompt_len=11,
+                output_len=6,
+                model="test-model",
+            )
+            return await async_request_openai_chat_completions_cached(inner_input)
+        finally:
+            await runner.cleanup()
+
+    try:
+        out = asyncio.run(_run())
+        assert out.success, f"request failed: {out.error}"
+        # TTFT 已在首个 reasoning token 上记录（非 0，且早于整体延迟）
+        assert 0 < out.ttft < out.latency, f"ttft={out.ttft}, latency={out.latency}"
+        # 思考段不进入 generated_text（供下一轮回放的上下文）
+        assert out.generated_text == "The answer is 42.", repr(out.generated_text)
+        # 后续 token 记录 itl（4 个 delta token → 3 个间隔）
+        assert len(out.itl) == 3, f"expected 3 itl entries, got {out.itl}"
+        assert all(x > 0 for x in out.itl), out.itl
+        assert out.output_len == 6
+        print(f"PASS: TTFT={out.ttft * 1000:.1f}ms recorded at first reasoning token, "
+              f"reasoning excluded from generated_text")
+    finally:
+        _ACTIVE_CHUNKS = SSE_CHUNKS
+
+
+def test_reasoning_effort_in_payload():
+    """--reasoning-effort low：extra_request_body 携带的 reasoning_effort 必须进入 payload。"""
+    global _ACTIVE_CHUNKS
+    _ACTIVE_CHUNKS = SSE_CHUNKS
+
+    async def _run():
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", _handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18114)
+        await site.start()
+        try:
+            inner_input = RequestFuncInput(
+                prompt="hello world",
+                api_url="http://127.0.0.1:18114/v1/chat/completions",
+                prompt_len=11,
+                output_len=4,
+                model="test-model",
+                extra_request_body={"reasoning_effort": "low"},
+            )
+            return await async_request_openai_chat_completions_cached(inner_input)
+        finally:
+            await runner.cleanup()
+
+    try:
+        out = asyncio.run(_run())
+        assert out.success, f"request failed: {out.error}"
+        assert _CAPTURED_PAYLOAD.get("reasoning_effort") == "low", \
+            f"payload missing reasoning_effort: {_CAPTURED_PAYLOAD}"
+        print("PASS: payload carries reasoning_effort=low via extra_request_body")
+    finally:
+        _ACTIVE_CHUNKS = SSE_CHUNKS
+
+
+def test_routing_key_header_sent():
+    """会话亲和：RequestFuncInput.routing_key 必须以 X-SMG-Routing-Key 请求头发出。
+
+    1010 报告 round1 命中率仅 34.1%（≈1/3）：多节点随机路由稀释了 prefix
+    cache 命中；网关需要该头做会话粘性路由。
+    """
+    global _ACTIVE_CHUNKS
+    _ACTIVE_CHUNKS = SSE_CHUNKS
+
+    async def _run():
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", _handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18115)
+        await site.start()
+        try:
+            inner_input = RequestFuncInput(
+                prompt="hello world",
+                api_url="http://127.0.0.1:18115/v1/chat/completions",
+                prompt_len=11,
+                output_len=4,
+                model="test-model",
+                routing_key="bench-session-0",
+            )
+            return await async_request_openai_chat_completions_cached(inner_input)
+        finally:
+            await runner.cleanup()
+
+    try:
+        out = asyncio.run(_run())
+        assert out.success, f"request failed: {out.error}"
+        assert _CAPTURED_HEADERS.get("X-SMG-Routing-Key") == "bench-session-0", \
+            f"routing header missing: {_CAPTURED_HEADERS}"
+        print("PASS: X-SMG-Routing-Key header sent for session affinity")
+    finally:
+        _ACTIVE_CHUNKS = SSE_CHUNKS
+
+
+def test_make_extra_request_body_reasoning():
+    """make_extra_request_body：--reasoning-effort 设置时进入 extra body，未设置时不携带。"""
+    import bench_multi_turn
+
+    args_on = types.SimpleNamespace(
+        temperature=0.0, top_p=1.0, ignore_eos=False, reasoning_effort="low")
+    body = bench_multi_turn.make_extra_request_body(args_on)
+    assert body.get("reasoning_effort") == "low", body
+
+    args_off = types.SimpleNamespace(
+        temperature=0.0, top_p=1.0, ignore_eos=False, reasoning_effort=None)
+    body = bench_multi_turn.make_extra_request_body(args_off)
+    assert "reasoning_effort" not in body, body
+    print("PASS: make_extra_request_body forwards reasoning_effort when set")
+
+
 if __name__ == "__main__":
     test_fork_captures_cached_tokens()
     test_round_breakdown_uses_server_values()
@@ -596,4 +756,8 @@ if __name__ == "__main__":
     test_tpm_concurrency_judgments()
     test_request_payload_uses_max_tokens()
     test_verify_output_cap()
+    test_ttft_first_token_includes_reasoning()
+    test_reasoning_effort_in_payload()
+    test_routing_key_header_sent()
+    test_make_extra_request_body_reasoning()
     print("\nAll smoke tests passed.")

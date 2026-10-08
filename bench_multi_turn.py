@@ -50,6 +50,8 @@ def make_extra_request_body(args):
         body["top_p"] = args.top_p
     if args.ignore_eos:
         body["ignore_eos"] = True
+    if getattr(args, "reasoning_effort", None):
+        body["reasoning_effort"] = args.reasoning_effort
     return body
 
 
@@ -278,16 +280,26 @@ async def run_benchmark(args):
 
     listener_task = asyncio.create_task(terminate_listener())
 
+    session_idx = 0
     async for req in get_ramp_request(
         input_requests, start_rps, target_rps, args.ramp_seconds,
         args.sustain_seconds, seed=args.seed, stop_event=stop_event,
     ):
         if stop_event.is_set():
             break
+        # 会话亲和路由：同一会话各轮带相同 routing_key，网关将其固定到同一
+        # 后端节点——prefix cache 命中的前提。1010 报告中 round1 命中率仅
+        # 34.1%（≈1/3）：多节点随机路由下，前一轮的前缀只在 1/N 概率的
+        # 同节点请求上可命中；亲和后 round1+ 理论命中 ~96%+。
+        affinity_key = (
+            None if args.no_session_affinity else f"bench-session-{session_idx}"
+        )
+        session_idx += 1
         rfi = RequestFuncInput(
             prompt=req.prompt, api_url=api_url, prompt_len=req.prompt_len,
             output_len=req.output_len, model=model, lora_name="",
             image_data=req.image_data, extra_request_body=extra_body,
+            routing_key=affinity_key,
         )
         tasks.append(asyncio.create_task(_run_one(rfi, pbar)))
 

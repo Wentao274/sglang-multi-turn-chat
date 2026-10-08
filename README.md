@@ -159,6 +159,8 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 2. 解析 `usage.prompt_tokens` → `output.prompt_tokens_actual`（服务端真实输入 token 数）。
 3. 解析 `usage.prompt_tokens_details.cached_tokens` → `output.cached_tokens`（prefix cache 命中 token 数）。
 4. 生成上限发送 **`max_tokens` 字段**（OpenAI 旧标准，vLLM/sglang/网关均识别），而非 `max_completion_tokens`（OpenAI 新字段，部分网关/旧版服务端不识别）——1007 事故：网关忽略该新字段，256 上限失效，实际每轮输出 ~1.7K token（计划的 6.8 倍），decode 预算/TPM/TPOT 全部失真。
+5. **TTFT 记录在首个任意类型 token（`content` 或 `reasoning_content`）到达时刻**——1010 报告：glm-5.3 为推理模型，86% 请求把 256 上限全部耗在思考段（无正文 token），旧口径下 `ttft=0`，TPOT 被算成 E2E/(n-1) 把排队+prefill+思考全部摊入（52.8ms vs 真实 decode ≈9.5ms）。思考文本不进入 `generated_text`（下一轮上下文只回放正文）。
+6. **会话亲和路由**：每会话生成 `routing_key`（`bench-session-{i}`）经 `X-SMG-Routing-Key` 请求头发给网关，同一会话各轮固定到同一后端节点——prefix cache 命中的前提（`--no-session-affinity` 关闭）。1010 报告 round1 命中率仅 34.1%（≈1/3）：多节点随机路由下前缀只在同节点请求上可命中。
 
 **max_tokens 生效自检**：warmup 会话完成后自动校验各轮输出是否 ≤ `--max-tokens-per-turn` 上限（容差 +8 token）；超限立即打印 `[warn]`——说明服务端没有透传/遵守 max_tokens，验收数据不可用，应先修复网关再测。
 
@@ -207,6 +209,10 @@ python -m sglang.launch_server --model-path <model> --enable-cache-report
 
 - `--target-tpm` 是加压目标（计划发送速率）；`actual_tpm_stable` 是服务端实际处理速率（验收依据）。默认（无 `--ignore-eos`）模型自然停止，实际输出 = min(自然长度, 256)，实际 TPM 略低于计划：8192 system prompt 占大头的推荐配置下 ≈ 计划的 ~99%，输出占比更高的场景可低至 ~85%。
 - **1007 事故教训**：客户端曾发送 `max_completion_tokens`（OpenAI 新字段），网关不识别也不报错——256 上限被静默忽略，实际每轮输出 ~1.7K token（6.8 倍），decode 预算/TPM/TPOT 全部失真。现改发 `max_tokens`（旧标准），warmup 后自动校验是否生效（超限打印 `[warn]`）。若仍告警，先单发一条 `max_tokens=256` 的请求检查 `usage.completion_tokens` 是否 ≤ 256，并排查网关字段透传。
+- **1010 报告教训（推理模型口径 + 路由亲和）**：
+  - glm-5.3 默认思考强度 `max`：86% 请求把 256 上限全部耗在思考段（正文 0 token）→ 旧客户端只认 `content` 记 TTFT，这些请求 `ttft=0`，TPOT=E2E/(n-1) 把排队+prefill+思考全部摊入（52.8ms，真实 decode ≈9.5ms）。已修复：TTFT 记在首个任意类型 token；推荐 `--reasoning-effort low` 缩短思考段。
+  - round1 命中率仅 34.1%（≈1/3）：多节点网关随机路由把同一会话的各轮分散到不同节点，前缀缓存只在"同节点"请求上可命中。已修复：默认开启会话亲和（`X-SMG-Routing-Key`），重测后检查分轮表 round1 命中率是否 ≥90%；若仍 ≈1/N，需网关侧开启粘性路由。
+  - TPM 35.3M（< 1 亿）为服务端容量瓶颈（TTFT 平均 10.85s 占 E2E 的 82%，prefill/排队主导）：亲和 + 低思考强度提高命中率并缩短 E2E 后吞吐会显著提升；若仍不足需服务端扩容（prefill 吞吐 ≈3 倍差距）或提高 `--max-concurrency`。
 - 因此推荐 `--target-tpm 120000000`（加压目标）+ `--accept-steady-tpm 100000000`（验收线）：无论校准比例是 85% 还是 99%，实际稳态 TPM 都能越过 1 亿验收线（85% → 1.02 亿，99% → 1.19 亿）；若服务端容量不足，实际 TPM 体现真实瓶颈，仍按验收线判定。
 - 测试为一次性判定（不重测）：不通过即出最终结论。
 - `--max-concurrency`（推荐 1000）仍生效：限制同时在途的请求数，报告展示 1 亿吞吐下实际压到的并发数（`peak_concurrency`）作为参考。
@@ -224,6 +230,7 @@ python bench_multi_turn.py \
   --num-sessions 50000 --num-turns 14 --min-turns 2 \
   --system-prompt-len 8192 \
   --max-tokens-per-turn 256 \
+  --reasoning-effort low \
   --start-tpm 0 --target-tpm 120000000 \
   --ramp-seconds 300 --sustain-seconds 600 \
   --drain-timeout 600 \
@@ -254,6 +261,8 @@ python bench_multi_turn.py \
 > **注意**：`--target-tpm` 是加压目标（实际发送速率），`--accept-steady-tpm` 是验收要求（期望达到的指标）。两者不同：加压目标应根据服务实际承受能力设定，验收要求是期望达标的门槛。`--avg-tokens-per-request` 默认 0=自动估算（从数据集每会话的轮数和 token 长度推算），无需手动设置。推荐配置 `--target-tpm 120000000 --accept-steady-tpm 100000000`——加压目标比 1 亿验收线高 20%，覆盖输出自然停止造成的实际<计划偏差（见下）。
 >
 > **TPM 校准提示**：默认（无 `--ignore-eos`）模型自然停止，实际输出 = min(自然长度, 256)，RPS 调度按计划 token 估算，因此**实际 TPM 略低于计划 TPM**（推荐配置下 ~99%）。加压目标 1.2 亿保证实际稳态 TPM ≥ 1 亿验收线。测试为一次性判定（不重测），实际压到的负载以报告 `actual_tpm_stable` 为准。
+>
+> **`--reasoning-effort low`**：glm-5.3 不支持关闭思考，默认思考强度 `max` 会把 256 上限全部耗在思考段（正文 0 token，TTFT 含全部思考时间）。`low` 缩短思考段，降低 TTFT 并提高正文占比。会话亲和路由默认开启（`--no-session-affinity` 关闭）——重测后检查报告分轮表 round1 命中率：若仍 ≈1/N（N=后端节点数），说明网关未按 `X-SMG-Routing-Key` 做粘性路由，需网关侧开启会话亲和。
 
 ```bash
 # 方式二：不激活虚拟环境，用 uv run（自动使用 .venv）
@@ -264,7 +273,7 @@ uv run python bench_multi_turn.py --num-sessions 50000 --num-turns 14 --min-turn
 
 ### 推荐命令参数详解
 
-推荐命令共 33 个参数，按功能分为 6 组：
+推荐命令共 34 个参数，按功能分为 6 组：
 
 **数据集参数（需求1：数据集 + 容量 + 防重复）**
 
@@ -274,6 +283,7 @@ uv run python bench_multi_turn.py --num-sessions 50000 --num-turns 14 --min-turn
 | `--num-turns` | `14` | 每会话最大对话轮数上限；自然轮数不足此值的会话按实际轮数执行 |
 | `--min-turns` | `2` | 仅保留 user 轮数 ≥ 该值的原始对话（过滤门槛）；ShareGPT 去重后 51,493 条满足 ≥2 轮 |
 | `--max-tokens-per-turn` | `256` | 每次 API 请求的 max_tokens 上限（payload 发送 `max_tokens` 字段；warmup 后自动校验生效性，超限告警） |
+| `--reasoning-effort` | `low` | 推理强度（low/medium/high），payload 附带 `reasoning_effort` 字段；glm-5.3 无法关闭思考，`low` 缩短思考段降低 TTFT（默认 `max` 会把 256 上限全耗在思考段） |
 | `--system-prompt-len` | `8192` | 每会话生成独立随机 system prompt 的 token 长度（防缓存命中 + 首轮即长上下文）；同时增大每会话 token 数，降低会话消耗速率 |
 | `--num-shared-prefixes` | （未传，默认 0） | 共享 system prompt 组数；默认 0=每会话唯一前缀（不同连续会话内容不同，符合客户要求）；>0=按 round-robin 分配共享前缀（跨会话也命中，非推荐模式） |
 
@@ -293,6 +303,7 @@ uv run python bench_multi_turn.py --num-sessions 50000 --num-turns 14 --min-turn
 | 参数 | 示例值 | 含义 |
 |---|---|---|
 | `--max-concurrency` | `1000` | 最大并发会话数（信号量上限），超过则新会话排队等待 |
+| `--no-session-affinity` | （开关） | 关闭会话亲和路由（默认开启）：每会话生成 `routing_key` 经 `X-SMG-Routing-Key` 头发给网关，同一会话各轮固定同一后端节点——多轮 prefix cache 命中的前提 |
 
 **衰减监控参数（需求3：异常/衰减终止）**
 
@@ -364,6 +375,7 @@ python bench_multi_turn.py \
 | `--num-turns` | 每会话最大轮数上限；自然轮数不足此值的会话按实际轮数 |
 | `--min-turns` | 仅保留 user 轮数不少于该值的原始对话（变长轮次过滤门槛，默认 2） |
 | `--max-tokens-per-turn` | 每轮生成 max_tokens 上限 |
+| `--reasoning-effort` | 推理强度（low/medium/high），payload 附带 `reasoning_effort` 字段；glm-5.3 用 low 缩短思考段 |
 | `--system-prompt-len` | >0 注入该长度随机 system prompt，首轮即长上下文 |
 | `--num-shared-prefixes` | 共享 system prompt 组数；默认 0=每会话唯一前缀（不同连续会话内容不同，符合客户要求）；>0=按 round-robin 分配共享前缀（跨会话也命中，非推荐模式） |
 | `--target-tpm` | 稳态目标 TPM，按 `--avg-tokens-per-request` 折算 RPS（默认 0=自动估算） |
@@ -372,6 +384,7 @@ python bench_multi_turn.py \
 | `--sustain-seconds` | 稳态持续时长；留空表示发完全部 `--num-sessions` |
 | `--ignore-eos` | 忽略 EOS 强制满长（吞吐场景）；默认尊重 EOS 模拟真实对话 |
 | `--max-concurrency` | 最大并发会话数 |
+| `--no-session-affinity` | 关闭会话亲和路由（默认开启：每会话固定同一后端节点，prefix cache 命中的前提） |
 | `--cache-report` | 采集 prefix cache 命中统计（fork 客户端默认已解析，无需此开关） |
 | `--max-error-rate` | 窗口错误率阈值，超过即终止（默认 0.10） |
 | `--throughput-drop-ratio` | 窗口吞吐跌至稳态基线该比例即终止（默认 0.5） |

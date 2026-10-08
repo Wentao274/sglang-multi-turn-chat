@@ -83,7 +83,11 @@ async def async_request_openai_chat_completions_cached(
       4. 生成上限发送 max_tokens 字段（而非 max_completion_tokens）：后者为
          OpenAI 新字段，旧版 sglang / 多数网关不识别——1007 事故中 256 上限
          被无视，每轮实际输出 ~1.7K token，decode 预算超 6.8x。
-    其余行为（TTFT/ITL/latency/output_len/错误处理）与内置版本一致。
+      5. TTFT 记录在首个任意类型 token（content 或 reasoning_content）到达
+         时刻：推理模型先输出思考段，若只认 content，纯思考请求 ttft=0，
+         TPOT 会被算成 E2E/(n-1) 把排队+prefill+思考全部摊入（1010 报告
+         中 86% 请求命中该口径缺陷，TPOT 虚高至 52.8ms，真实 decode ≈9.5ms）。
+    其余行为（ITL/latency/output_len/错误处理）与内置版本一致。
     """
     api_url = request_func_input.api_url
     assert api_url.endswith(
@@ -178,7 +182,12 @@ async def async_request_openai_chat_completions_cached(
                                 if choices:
                                     delta = (choices[0] or {}).get("delta") or {}
                                     content = delta.get("content", "")
-                                    if content:
+                                    # 推理模型先流式输出 reasoning_content 再输出
+                                    # content：TTFT 必须记在首个任意类型 token 上。
+                                    # 否则纯思考请求 ttft=0，TPOT=E2E/(n-1) 会把
+                                    # 排队+prefill+思考时间全部摊入（虚高 5 倍）。
+                                    reasoning = delta.get("reasoning_content", "")
+                                    if content or reasoning:
                                         timestamp = time.perf_counter()
                                         if ttft == 0.0:
                                             ttft = timestamp - st
@@ -188,7 +197,8 @@ async def async_request_openai_chat_completions_cached(
                                                 timestamp - most_recent_timestamp
                                             )
                                         most_recent_timestamp = timestamp
-                                        generated_text += content
+                                        if content:
+                                            generated_text += content
 
                                 usage = data.get("usage") or {}
                                 if usage:
