@@ -28,11 +28,14 @@ def wrap_multi_turn_request_func(request_func, backend):
     头，会话亲和路由的前提）被丢弃——导致：
       1. 网关仍随机路由，round1+ 缓存命中 ≈ 1/N；
       2. glm-5.3 始终满强度思考，输出频繁触顶。
-    本地 fork 在 inner 请求上显式带上这两个字段。
+
+    注意：不触碰 start_time——不同版本 sglang 的 RequestFuncInput 字段
+    不同（服务器版无该字段，直接访问会 AttributeError，1008_4 全部请求
+    失败的根因）；且 request_client 已为每轮 output 设置真实请求时间戳，
+    稳态窗口过滤依赖它，wrapper 覆盖会破坏报告。
     """
     async def _wrapped_multi_turn(input, pbar=None):
         results = []
-        start_time = input.start_time
         extra_request_body = getattr(input, "extra_request_body", None)
         routing_key = getattr(input, "routing_key", None)
         for i, prompt in enumerate(input.prompt):
@@ -49,11 +52,12 @@ def wrap_multi_turn_request_func(request_func, backend):
                 request_func_input=inner_input,
                 pbar=pbar if i == len(input.prompt) - 1 else None,
             )
-            output.start_time = start_time if start_time else 0.0
             results.append(output)
         return results
 
     return _wrapped_multi_turn
+
+
 from sglang.benchmark.utils import get_tokenizer
 
 from config import build_parser, compute_rps, load_env, make_serving_namespace, _preparse_env_file

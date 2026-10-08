@@ -780,8 +780,9 @@ def test_wrapper_propagates_routing_and_effort():
     """端到端：经过 bench_multi_turn.wrap_multi_turn_request_func 的请求
     必须携带 X-SMG-Routing-Key 头与 reasoning_effort 字段。
 
-    之前缺一个走 wrapper 的测试，routing_key / extra_request_body 被内置
-    wrap_multi_turn_request_func 丢弃也发现不了。
+    用 SimpleNamespace 模拟服务器版 sglang 的 RequestFuncInput——
+    服务器版（旧 sglang）没有 start_time 字段，wrapper 直接访问
+    input.start_time 会 AttributeError（1008_4 全部请求失败的根因）。
     """
     global _ACTIVE_CHUNKS, _CAPTURED_HEADERS, _CAPTURED_PAYLOAD
     _ACTIVE_CHUNKS = SSE_CHUNKS
@@ -802,7 +803,8 @@ def test_wrapper_propagates_routing_and_effort():
             wrapped = bench_multi_turn.wrap_multi_turn_request_func(
                 async_request_openai_chat_completions_cached, backend="sglang"
             )
-            outer_input = RequestFuncInput(
+            # 模拟服务器版 sglang：无 start_time 字段
+            outer_input = types.SimpleNamespace(
                 prompt=["turn 1", "turn 2"],
                 api_url="http://127.0.0.1:18116/v1/chat/completions",
                 prompt_len=11,
@@ -822,7 +824,12 @@ def test_wrapper_propagates_routing_and_effort():
             f"wrapper dropped routing_key: {_CAPTURED_HEADERS}"
         assert _CAPTURED_PAYLOAD.get("reasoning_effort") == "low", \
             f"wrapper dropped reasoning_effort: {_CAPTURED_PAYLOAD}"
-        print("PASS: wrapper propagates routing_key and reasoning_effort")
+        # 每轮 output 的 start_time 由 request_client 设置（真实请求时间），
+        # wrapper 不得覆盖为 0（稳态窗口过滤依赖它）
+        assert all(getattr(o, "start_time", None) for o in outs), \
+            "wrapper must not zero out output.start_time"
+        print("PASS: wrapper propagates routing_key and reasoning_effort "
+              "(server-style input without start_time)")
     finally:
         _ACTIVE_CHUNKS = SSE_CHUNKS
         _CAPTURED_HEADERS = {}
