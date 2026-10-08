@@ -114,6 +114,10 @@ _serving_ns = types.SimpleNamespace(
     max_concurrency=10,
     seed=42,
     pbar=False,
+    # make_serving_namespace 透传的兜底字段（安装版 wrapper 丢弃自定义字段后
+    # request_client 从这里读取）
+    reasoning_effort=None,
+    no_session_affinity=False,
 )
 
 
@@ -814,6 +818,8 @@ def test_wrapper_propagates_routing_and_effort():
     - routing_key 从首条消息内容哈希推导——同一会话各轮首条消息相同 →
       同一 key → 网关亲和路由依然成立
     - reasoning_effort 从 serving.args 读取（全测试同值）
+    - --no-session-affinity 时跳过内容哈希兜底（网关侧强制固定路由，
+      客户端不再发 X-SMG-Routing-Key 头）
 
     同时验证 wrapper 逐轮累积对话历史（round1+ 请求携带前轮内容 →
     prefix cache 命中前提），且不触碰 start_time（1008_4 根因）与
@@ -848,24 +854,24 @@ def test_wrapper_propagates_routing_and_effort():
                 output_len=6,
                 model="test-model",
             )
-            return await wrapped(outer_input, pbar=None)
+            outs = await wrapped(outer_input, pbar=None)
+            phase1_keys = list(_ROUTING_KEYS)
+            # 第二阶段：--no-session-affinity（网关侧强制固定路由时）
+            # 客户端不发 X-SMG-Routing-Key 头
+            _ROUTING_KEYS.clear()
+            _serving_ns.no_session_affinity = True
+            await wrapped(outer_input, pbar=None)
+            return outs, phase1_keys
         finally:
             await runner.cleanup()
 
     # 安装版 wrapper 丢弃 extra_request_body → request_client 从 serving.args 兜底
     _serving_ns.reasoning_effort = "low"
     try:
-        outs = asyncio.run(_run())
+        outs, phase1_keys = asyncio.run(_run())
         assert len(outs) == 2, f"expected 2 results, got {len(outs)}"
         assert _CAPTURED_PAYLOAD.get("reasoning_effort") == "low", \
             f"payload missing reasoning_effort: {_CAPTURED_PAYLOAD}"
-        # 内容哈希路由：两轮请求的 X-SMG-Routing-Key 相同（同一会话）
-        assert len(_ROUTING_KEYS) == 2, \
-            f"expected 2 captured routing keys, got {_ROUTING_KEYS}"
-        assert all(k and k.startswith("bench-") for k in _ROUTING_KEYS), \
-            f"content-hash routing key missing: {_ROUTING_KEYS}"
-        assert _ROUTING_KEYS[0] == _ROUTING_KEYS[1], \
-            f"routing key must be stable across rounds: {_ROUTING_KEYS}"
         # 历史累积：最后一轮请求的 messages 含第一轮内容 + 助手回复
         msgs = _CAPTURED_PAYLOAD.get("messages", [])
         texts = [m.get("content") for m in msgs]
@@ -877,10 +883,24 @@ def test_wrapper_propagates_routing_and_effort():
         # wrapper 不得覆盖为 0（稳态窗口过滤依赖它）
         assert all(getattr(o, "start_time", None) for o in outs), \
             "wrapper must not zero out output.start_time"
+        # 内容哈希路由：两轮请求的 X-SMG-Routing-Key 相同（同一会话）
+        assert len(phase1_keys) == 2, \
+            f"expected 2 captured routing keys, got {phase1_keys}"
+        assert all(k and k.startswith("bench-") for k in phase1_keys), \
+            f"content-hash routing key missing: {phase1_keys}"
+        assert phase1_keys[0] == phase1_keys[1], \
+            f"routing key must be stable across rounds: {phase1_keys}"
+        # 第二阶段：no-affinity 路径下两轮请求均无路由头
+        assert len(_ROUTING_KEYS) == 2, \
+            f"expected 2 requests in no-affinity phase, got {_ROUTING_KEYS}"
+        assert all(k is None for k in _ROUTING_KEYS), \
+            f"--no-session-affinity must not send routing headers: {_ROUTING_KEYS}"
         print("PASS: wrapper path keeps affinity header, reasoning_effort, "
-              "and multi-turn history")
+              "and multi-turn history; --no-session-affinity disables "
+              "routing-key fallback")
     finally:
         _serving_ns.reasoning_effort = None
+        _serving_ns.no_session_affinity = False
         _ACTIVE_CHUNKS = SSE_CHUNKS
         _CAPTURED_HEADERS = {}
         _CAPTURED_PAYLOAD = {}

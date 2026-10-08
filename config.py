@@ -202,7 +202,10 @@ def make_serving_namespace(args):
         top_logprobs_num=0,
         token_ids_logprob=None,
         logprob_start_len=0,
-        # sglang 自带 multi-turn wrapper 丢弃 extra_request_body 字段，
-        # request_client 从 serving.args 兜底读取 reasoning_effort
+        # sglang 自带 multi-turn wrapper 丢弃 extra_request_body / routing_key 字段，
+        # request_client 从 serving.args 兜底读取 reasoning_effort；
+        # no_session_affinity 用于关闭 routing_key 的内容哈希兜底
+        # （网关侧强制固定路由时，客户端不再发 X-SMG-Routing-Key 头）
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        no_session_affinity=bool(getattr(args, "no_session_affinity", False)),
     )

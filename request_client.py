@@ -140,11 +140,12 @@ async def async_request_openai_chat_completions_cached(
 
         headers = _get_request_headers()
         routing_key = getattr(request_func_input, "routing_key", None)
-        if not routing_key:
+        if not routing_key and not getattr(sargs, "no_session_affinity", False):
             # 自带 wrapper 同样丢弃 routing_key —— 从首条消息内容哈希推导
-            # 会话标识：同一会话各轮的第一条消息相同（数据集按首轮 md5 去重，
-            # 跨会话唯一；per-session system prompt 亦唯一），内容哈希即稳定
-            # 的会话 ID，网关亲和（X-SMG-Routing-Key）依然成立。
+            # 会话标识：同一会话各轮的第一条消息相同（数据集按首轮去重，
+            # 跨会话唯一），内容哈希即稳定的会话 ID，网关亲和
+            # （X-SMG-Routing-Key）依然成立。--no-session-affinity 时跳过
+            # （网关侧已强制固定路由，客户端不再发头）。
             try:
                 routing_key = "bench-" + hashlib.md5(
                     json.dumps(messages[0], sort_keys=True, ensure_ascii=False)
